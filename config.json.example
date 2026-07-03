@@ -1,0 +1,7 @@
+{
+  "host": "zmailbox.example.com",
+  "email": "you@example.com",
+  "password": "your-password",
+  "folder_id": 373,
+  "limit": 10
+}
