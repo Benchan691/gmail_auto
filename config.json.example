@@ -3,5 +3,14 @@
   "email": "you@example.com",
   "password": "your-password",
   "folder_id": 373,
-  "limit": 10
+  "limit": 10,
+  "splunk_web_url": "https://172.16.32.8:8000",
+  "splunk_rest_url": "",
+  "splunk_username": "your-splunk-username",
+  "splunk_password": "your-splunk-password",
+  "splunk_lookup_name": "case_lookup.csv",
+  "splunk_app": "search",
+  "splunk_owner": "your-splunk-username",
+  "splunk_verify_tls": false,
+  "splunk_timeout": 180
 }
