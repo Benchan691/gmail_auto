@@ -1,7 +1,6 @@
 import imaplib
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
-from pathlib import Path
 
 from case_parser import case_fields_for_json, parse_case_fields, plain_text_body
 from common import require_requests
@@ -455,30 +454,28 @@ def _print_record(index: int, record: dict) -> None:
         print(f"   resolution: {record['resolution'][:120]}")
 
 
-def extract_folder_emails(host: str, email: str, password: str, folder_path: str, limit: int, output_dir: str = "output") -> None:
-    token = zimbra_soap_login(host, email, password)
-    folder = zimbra_resolve_folder_path(host, token, folder_path)
-    folder_id = folder["id"]
-    folder_label = f"{folder['name']} ({folder['abs_path']})" if folder else f"id={folder_id}"
-    out_path = Path(output_dir)
-    out_path.mkdir(parents=True, exist_ok=True)
-
-    print(f"\n[*] Extracting last {limit} closed email(s) from folder path={folder_path} (id={folder_id})")
-    print(f"    folder: {folder_label}")
-    print(f"    output: {out_path.resolve()}")
-
-    extracted = fetch_folder_records(host, token, folder_id, limit)
-    if not extracted:
-        print("[-] No closed messages found in this folder.")
-        return
-
-    for index, record in enumerate(extracted, start=1):
-        _print_record(index, record)
-
+def collect_new_closed_records(
+    host: str, token: str, folder_id: str, output_dir: str, limit: int
+) -> list[dict]:
     summary_path = emails_path(output_dir)
-    save_emails(summary_path, extracted)
-    print(f"\n[+] Extracted {len(extracted)} closed email(s)")
-    print(f"[+] Saved: {summary_path.resolve()}")
+    existing = load_emails(summary_path)
+    if not existing:
+        return fetch_folder_records(host, token, folder_id, limit)
+
+    known_ids = email_ids(existing)
+    return fetch_new_closed_folder_records(host, token, folder_id, known_ids, limit)
+
+
+def save_new_closed_records(output_dir: str, new_records: list[dict], limit: int) -> int:
+    summary_path = emails_path(output_dir)
+    existing = load_emails(summary_path)
+    if not existing:
+        save_emails(summary_path, new_records)
+        return len(new_records)
+
+    merged = merge_new_emails(existing, new_records, limit)
+    save_emails(summary_path, merged)
+    return len(merged)
 
 
 def watch_folder_emails(host: str, email: str, password: str, folder_path: str, limit: int, output_dir: str = "output") -> None:
@@ -495,25 +492,64 @@ def watch_folder_emails(host: str, email: str, password: str, folder_path: str, 
     existing = load_emails(summary_path)
     if not existing:
         print("[*] No emails.json yet — fetching up to limit closed message(s)")
-        records = fetch_folder_records(host, token, folder_id, limit)
-        if not records:
+
+    new_records = collect_new_closed_records(host, token, folder_id, output_dir, limit)
+    if not new_records:
+        if existing:
+            print("[+] 0 new closed message(s)")
+        else:
             print("[-] No closed messages found in this folder.")
-            return
-        save_emails(summary_path, records)
-        print(f"[+] Saved {len(records)} closed email(s) to {summary_path.resolve()}")
         return
 
-    known_ids = email_ids(existing)
-    new_records = fetch_new_closed_folder_records(host, token, folder_id, known_ids, limit)
+    total = save_new_closed_records(output_dir, new_records, limit)
+    if existing:
+        print(f"[+] {len(new_records)} new closed message(s), {total} total in {summary_path.resolve()}")
+    else:
+        print(f"[+] Saved {len(new_records)} closed email(s) to {summary_path.resolve()}")
+
+    for index, record in enumerate(new_records, start=1):
+        _print_record(index, record)
+
+
+def sync_folder_emails(
+    host: str,
+    email: str,
+    password: str,
+    folder_path: str,
+    limit: int,
+    output_dir: str,
+    config: dict,
+) -> None:
+    from splunk_lookup import update_splunk_from_records
+
+    token = zimbra_soap_login(host, email, password)
+    folder = zimbra_resolve_folder_path(host, token, folder_path)
+    folder_id = folder["id"]
+    folder_label = f"{folder['name']} ({folder['abs_path']})" if folder else f"id={folder_id}"
+    summary_path = emails_path(output_dir)
+
+    print(f"\n[*] Syncing folder path={folder_path} (id={folder_id}, {folder_label})")
+    print(f"    closed limit: {limit}")
+    print(f"    output: {summary_path.resolve()}")
+
+    existing = load_emails(summary_path)
+    if not existing:
+        print("[*] No emails.json yet — fetching up to limit closed message(s)")
+
+    new_records = collect_new_closed_records(host, token, folder_id, output_dir, limit)
     if not new_records:
         print("[+] 0 new closed message(s)")
         return
 
-    merged = merge_new_emails(existing, new_records, limit)
-    save_emails(summary_path, merged)
-    print(f"[+] {len(new_records)} new closed message(s), {len(merged)} total in {summary_path.resolve()}")
+    total = save_new_closed_records(output_dir, new_records, limit)
     for index, record in enumerate(new_records, start=1):
         _print_record(index, record)
+
+    splunk_rows = update_splunk_from_records(new_records, config)
+    print(
+        f"\n[+] Sync complete: {len(new_records)} new closed message(s), "
+        f"{total} total in {summary_path.resolve()}, {splunk_rows} Splunk lookup row(s) updated"
+    )
 
 
 def list_folder_emails(host: str, email: str, password: str, folder_path: str, limit: int) -> None:

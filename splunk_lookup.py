@@ -211,41 +211,24 @@ def _splunk_update_case(session, settings: dict, update: dict) -> int:
     return match_count
 
 
-def update_splunk_from_folder(host: str, email: str, password: str, folder_path: str, limit: int, config: dict) -> None:
+def update_splunk_from_records(records: list[dict], config: dict) -> int:
+    if not records:
+        return 0
+
     req = require_requests()
     settings = _required_splunk_config(config)
     if not settings["verify_tls"]:
         req.packages.urllib3.disable_warnings()
 
-    debug("Starting update-splunk")
-    debug(f"Mail host={host} folder_path={folder_path} limit={limit}")
-    debug(
-        "Splunk target "
-        f"rest_url={settings['rest_url']} app={settings['app']} owner={settings['owner']} "
-        f"verify_tls={settings['verify_tls']}"
-    )
-
-    token = zimbra_soap_login(host, email, password)
-    folder = zimbra_resolve_folder_path(host, token, folder_path)
-    folder_id = folder["id"]
-    folder_label = f"{folder['name']} ({folder['abs_path']})" if folder else f"id={folder_id}"
-    debug(f"Zimbra folder resolved: {folder_label}")
-
-    closed_records = scan_closed_folder_records(host, token, folder_id, limit)
-    debug(f"Zimbra closed scan complete: records={len(closed_records)}")
-    if not closed_records:
-        print("[-] No closed messages found in this folder.")
-        return
-
     updates: dict[str, dict] = {}
-    for index, record in enumerate(closed_records, start=1):
+    for index, record in enumerate(records, start=1):
         case_fields = {
             "case_number": record.get("case_number") or "N/A",
             "case_status": record.get("case_status") or "N/A",
             "resolution": record.get("resolution") or "N/A",
         }
         debug(
-            f"Parsed closed message {index}/{len(closed_records)}: id={record.get('id')} "
+            f"Parsed closed message {index}/{len(records)}: id={record.get('id')} "
             f"case={case_fields['case_number']} status={case_fields['case_status']} "
             f"resolution_chars={len(case_fields['resolution'])}"
         )
@@ -270,7 +253,7 @@ def update_splunk_from_folder(host: str, email: str, password: str, folder_path:
 
     if not updates:
         print("[-] No closed cases with usable resolutions found.")
-        return
+        return 0
 
     debug(f"Connecting to Splunk REST for {len(updates)} queued case update(s)")
     session = req.Session()
@@ -279,6 +262,33 @@ def update_splunk_from_folder(host: str, email: str, password: str, folder_path:
         total_rows += _splunk_update_case(session, settings, update)
 
     print(f"[+] Done. Cases queued={len(updates)} lookup rows updated={total_rows}")
+    return total_rows
+
+
+def update_splunk_from_folder(host: str, email: str, password: str, folder_path: str, limit: int, config: dict) -> None:
+    debug("Starting update-splunk")
+    debug(f"Mail host={host} folder_path={folder_path} limit={limit}")
+
+    settings = _required_splunk_config(config)
+    debug(
+        "Splunk target "
+        f"rest_url={settings['rest_url']} app={settings['app']} owner={settings['owner']} "
+        f"verify_tls={settings['verify_tls']}"
+    )
+
+    token = zimbra_soap_login(host, email, password)
+    folder = zimbra_resolve_folder_path(host, token, folder_path)
+    folder_id = folder["id"]
+    folder_label = f"{folder['name']} ({folder['abs_path']})" if folder else f"id={folder_id}"
+    debug(f"Zimbra folder resolved: {folder_label}")
+
+    closed_records = scan_closed_folder_records(host, token, folder_id, limit)
+    debug(f"Zimbra closed scan complete: records={len(closed_records)}")
+    if not closed_records:
+        print("[-] No closed messages found in this folder.")
+        return
+
+    update_splunk_from_records(closed_records, config)
 
 
 def run_self_test() -> None:

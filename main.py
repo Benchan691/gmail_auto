@@ -3,9 +3,9 @@ import argparse
 from common import CONFIG_PATH, load_config
 from splunk_lookup import run_self_test, update_splunk_from_folder
 from zimbra import (
-    extract_folder_emails,
     find_cust_g50095,
     list_folder_emails,
+    sync_folder_emails,
     test_imap_login,
     watch_folder_emails,
     zimbra_get_info,
@@ -17,9 +17,9 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--method",
-        choices=["imap", "soap", "both", "find", "list", "extract", "watch", "update-splunk"],
+        choices=["imap", "soap", "both", "find", "list", "watch", "sync", "update-splunk"],
         default="both",
-        help="Login/test, find, list/extract/watch emails, or update Splunk lookup",
+        help="Login/test, find, list/watch/sync emails, or update Splunk lookup",
     )
     parser.add_argument(
         "--self-test",
@@ -29,7 +29,7 @@ def main():
     parser.add_argument("--config", default=CONFIG_PATH, help="Path to config.json")
     parser.add_argument("--folder-path", type=str, help="Folder path to read emails from (overrides config folder_path)")
     parser.add_argument("--limit", type=int, help="Number of recent emails to list (overrides config limit)")
-    parser.add_argument("--output", default="output", help="Output directory for --method extract or watch")
+    parser.add_argument("--output", default="output", help="Output directory for --method sync or watch")
 
     args = parser.parse_args()
     if args.self_test:
@@ -63,18 +63,18 @@ def main():
             print("[-] List failed:", e)
         return
 
-    if args.method == "extract":
-        try:
-            extract_folder_emails(host, email, password, folder_path, limit, args.output)
-        except Exception as e:
-            print("[-] Extract failed:", e)
-        return
-
     if args.method == "watch":
         try:
             watch_folder_emails(host, email, password, folder_path, limit, args.output)
         except Exception as e:
             print("[-] Watch failed:", e)
+        return
+
+    if args.method == "sync":
+        try:
+            sync_folder_emails(host, email, password, folder_path, limit, args.output, config)
+        except Exception as e:
+            print("[-] Sync failed:", e)
         return
 
     if args.method == "update-splunk":

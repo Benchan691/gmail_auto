@@ -2,7 +2,7 @@ import unittest
 from unittest.mock import patch
 
 from email_store import email_ids, merge_new_emails
-from zimbra import is_closed_record, scan_closed_folder_records
+from zimbra import is_closed_record, scan_closed_folder_records, sync_folder_emails
 
 
 class TestEmailStore(unittest.TestCase):
@@ -103,6 +103,55 @@ class TestScanClosedFolderRecords(unittest.TestCase):
 
         self.assertEqual(calls["n"], 2)
         self.assertEqual([r["id"] for r in result], ["closed1", "closed2"])
+
+
+class TestSyncFolderEmails(unittest.TestCase):
+    def _record(self, record_id: str) -> dict:
+        return {
+            "id": record_id,
+            "subject": f"Case {record_id}",
+            "case_number": "500952026070510025940",
+            "case_status": "Closed",
+            "resolution": "Resolved by test",
+        }
+
+    @patch("splunk_lookup.update_splunk_from_records")
+    @patch("zimbra.save_new_closed_records")
+    @patch("zimbra.collect_new_closed_records")
+    @patch("zimbra.zimbra_resolve_folder_path")
+    @patch("zimbra.zimbra_soap_login")
+    def test_sync_saves_and_updates_splunk_for_new_records(
+        self, mock_login, mock_resolve, mock_collect, mock_save, mock_splunk
+    ):
+        new_records = [self._record("new-1"), self._record("new-2")]
+        mock_login.return_value = "token"
+        mock_resolve.return_value = {"id": "373", "name": "Inbox", "abs_path": "/Inbox"}
+        mock_collect.return_value = new_records
+        mock_save.return_value = 2
+        mock_splunk.return_value = 2
+
+        sync_folder_emails("host", "user@example.com", "pass", "373", 10, "output", {})
+
+        mock_collect.assert_called_once_with("host", "token", "373", "output", 10)
+        mock_save.assert_called_once_with("output", new_records, 10)
+        mock_splunk.assert_called_once_with(new_records, {})
+
+    @patch("splunk_lookup.update_splunk_from_records")
+    @patch("zimbra.save_new_closed_records")
+    @patch("zimbra.collect_new_closed_records")
+    @patch("zimbra.zimbra_resolve_folder_path")
+    @patch("zimbra.zimbra_soap_login")
+    def test_sync_skips_save_and_splunk_when_no_new_records(
+        self, mock_login, mock_resolve, mock_collect, mock_save, mock_splunk
+    ):
+        mock_login.return_value = "token"
+        mock_resolve.return_value = {"id": "373", "name": "Inbox", "abs_path": "/Inbox"}
+        mock_collect.return_value = []
+
+        sync_folder_emails("host", "user@example.com", "pass", "373", 10, "output", {})
+
+        mock_save.assert_not_called()
+        mock_splunk.assert_not_called()
 
 
 if __name__ == "__main__":
