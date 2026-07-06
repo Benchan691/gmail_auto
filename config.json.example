@@ -8,7 +8,6 @@
   "splunk_rest_url": "",
   "splunk_username": "your-splunk-username",
   "splunk_password": "your-splunk-password",
-  "splunk_lookup_name": "case_lookup.csv",
   "splunk_app": "search",
   "splunk_owner": "your-splunk-username",
   "splunk_verify_tls": false,

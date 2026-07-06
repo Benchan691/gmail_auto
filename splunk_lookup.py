@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import json
 import time
 from urllib.parse import quote, urlparse, urlunparse
@@ -30,7 +32,7 @@ def _derive_splunk_rest_url(config: dict) -> str:
 
 
 def _required_splunk_config(config: dict) -> dict:
-    required = ["splunk_username", "splunk_password", "splunk_lookup_name"]
+    required = ["splunk_username", "splunk_password"]
     missing = [key for key in required if not config.get(key)]
     if not config.get("splunk_web_url") and not config.get("splunk_rest_url"):
         missing.append("splunk_web_url or splunk_rest_url")
@@ -42,12 +44,18 @@ def _required_splunk_config(config: dict) -> dict:
         "rest_url": _derive_splunk_rest_url(config),
         "username": username,
         "password": config["splunk_password"],
-        "lookup_name": config["splunk_lookup_name"],
         "app": config.get("splunk_app") or "search",
         "owner": config.get("splunk_owner") or username,
         "verify_tls": config_bool(config, "splunk_verify_tls", False),
         "timeout": int(config.get("splunk_timeout", 180)),
     }
+
+
+def lookup_name_from_case_number(case_number: str) -> str:
+    digits = "".join(c for c in str(case_number).strip() if c.isdigit())
+    if len(digits) < 5:
+        raise ValueError(f"case_number too short for lookup name: {case_number!r}")
+    return f"G{digits[:5]}_Ticket_Status.csv"
 
 
 def _splunk_literal(value: str) -> str:
@@ -173,7 +181,11 @@ def build_splunk_update_search(lookup_name: str, case_number: str, resolution: s
 
 def _splunk_update_case(session, settings: dict, update: dict) -> int:
     case_number = update["case_number"]
-    lookup_name = settings["lookup_name"]
+    try:
+        lookup_name = lookup_name_from_case_number(case_number)
+    except ValueError as e:
+        print(f"[-] Skip TicketNumber={case_number}: {e}")
+        return 0
 
     rows = _splunk_run_search(
         session,
@@ -183,9 +195,9 @@ def _splunk_update_case(session, settings: dict, update: dict) -> int:
         want_results=True,
     )
     match_count = int((rows[0] if rows else {}).get("count") or 0)
-    debug(f"Splunk lookup match count: TicketNumber={case_number} rows={match_count}")
+    debug(f"Splunk lookup match count: lookup={lookup_name} TicketNumber={case_number} rows={match_count}")
     if match_count == 0:
-        print(f"[-] No lookup row matched TicketNumber={case_number}; skipped")
+        print(f"[-] No lookup row matched TicketNumber={case_number} in {lookup_name}; skipped")
         return 0
 
     _splunk_run_search(
@@ -195,7 +207,7 @@ def _splunk_update_case(session, settings: dict, update: dict) -> int:
         f"update {case_number}",
         want_results=False,
     )
-    print(f"[+] Updated TicketNumber={case_number}: rows={match_count}")
+    print(f"[+] Updated TicketNumber={case_number} in {lookup_name}: rows={match_count}")
     return match_count
 
 
@@ -210,7 +222,7 @@ def update_splunk_from_folder(host: str, email: str, password: str, folder_path:
     debug(
         "Splunk target "
         f"rest_url={settings['rest_url']} app={settings['app']} owner={settings['owner']} "
-        f"lookup={settings['lookup_name']} verify_tls={settings['verify_tls']}"
+        f"verify_tls={settings['verify_tls']}"
     )
 
     token = zimbra_soap_login(host, email, password)
@@ -245,8 +257,16 @@ def update_splunk_from_folder(host: str, email: str, password: str, folder_path:
         if update["case_number"] in updates:
             debug(f"Skip duplicate closed case {update['case_number']}: newest message already queued")
             continue
+        try:
+            lookup_name = lookup_name_from_case_number(update["case_number"])
+        except ValueError as e:
+            debug(f"Skip case {update['case_number']}: {e}")
+            continue
         updates[update["case_number"]] = update
-        debug(f"Queued update: TicketNumber={update['case_number']} Actionable chars={len(update['resolution'])}")
+        debug(
+            f"Queued update: TicketNumber={update['case_number']} lookup={lookup_name} "
+            f"Actionable chars={len(update['resolution'])}"
+        )
 
     if not updates:
         print("[-] No closed cases with usable resolutions found.")
@@ -281,7 +301,12 @@ Second line "quoted"
     assert non_closed is None
     assert "not Closed" in reason
 
-    search = build_splunk_update_search("case_lookup.csv", update["case_number"], update["resolution"])
+    assert lookup_name_from_case_number("500952026070510025940") == "G50095_Ticket_Status.csv"
+    lookup_name = lookup_name_from_case_number(update["case_number"])
+    assert lookup_name == "G12345_Ticket_Status.csv"
+
+    search = build_splunk_update_search(lookup_name, update["case_number"], update["resolution"])
+    assert 'inputlookup "G12345_Ticket_Status.csv"' in search
     assert 'Status=if(TicketNumber="1234567890", "Resolved", Status)' in search
     assert 'Matrix=if(TicketNumber="1234567890", "False Positive", Matrix)' in search
     assert 'First line\\nSecond line \\"quoted\\"' in search
