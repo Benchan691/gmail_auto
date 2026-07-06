@@ -166,7 +166,8 @@ def zimbra_list_folders(host: str, auth_token: str) -> list[dict]:
     folders: list[dict] = []
 
     def walk(elem, parent_id: str = "") -> None:
-        if _local_name(elem.tag) != "folder":
+        tag = _local_name(elem.tag)
+        if tag not in ("folder", "link"):
             for child in elem:
                 walk(child, parent_id)
             return
@@ -185,11 +186,11 @@ def zimbra_list_folders(host: str, auth_token: str) -> list[dict]:
             }
         )
         for child in elem:
-            if _local_name(child.tag) == "folder":
+            if _local_name(child.tag) in ("folder", "link"):
                 walk(child, folder_id)
 
     for child in root.iter():
-        if _local_name(child.tag) == "folder" and child.get("id"):
+        if _local_name(child.tag) in ("folder", "link") and child.get("id"):
             if not any(f["id"] == child.get("id") for f in folders):
                 walk(child)
     return folders
@@ -259,7 +260,8 @@ def zimbra_resolve_folder_path(host: str, auth_token: str, folder_path: str) -> 
     paths = _folder_path_by_id(folders)
 
     def clean(value: str) -> str:
-        return (value or "").strip().strip("/").lower()
+        text = (value or "").strip().strip("/").lower()
+        return text.replace("\u2019", "'").replace("\u2018", "'")
 
     exact_hits = [
         folder
