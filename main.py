@@ -7,6 +7,7 @@ from zimbra import (
     find_cust_g50095,
     list_folder_emails,
     test_imap_login,
+    watch_folder_emails,
     zimbra_get_info,
     zimbra_soap_login,
 )
@@ -16,9 +17,9 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--method",
-        choices=["imap", "soap", "both", "find", "list", "extract", "update-splunk"],
+        choices=["imap", "soap", "both", "find", "list", "extract", "watch", "update-splunk"],
         default="both",
-        help="Login/test, find, list/extract emails, or update Splunk lookup",
+        help="Login/test, find, list/extract/watch emails, or update Splunk lookup",
     )
     parser.add_argument(
         "--self-test",
@@ -26,9 +27,9 @@ def main():
         help="Run local parser/SPL self-checks and exit",
     )
     parser.add_argument("--config", default=CONFIG_PATH, help="Path to config.json")
-    parser.add_argument("--folder-id", type=str, help="Folder id to list emails from (overrides config folder_id)")
+    parser.add_argument("--folder-path", type=str, help="Folder path to read emails from (overrides config folder_path)")
     parser.add_argument("--limit", type=int, help="Number of recent emails to list (overrides config limit)")
-    parser.add_argument("--output", default="output", help="Output directory for --method extract")
+    parser.add_argument("--output", default="output", help="Output directory for --method extract or watch")
 
     args = parser.parse_args()
     if args.self_test:
@@ -39,7 +40,7 @@ def main():
     host = config["host"]
     email = config["email"]
     password = config["password"]
-    folder_id = str(args.folder_id if args.folder_id is not None else config.get("folder_id", 2))
+    folder_path = str(args.folder_path if args.folder_path is not None else config.get("folder_path", "Inbox"))
     limit = args.limit if args.limit is not None else int(config.get("limit", 10))
 
     if args.method in ["imap", "both"]:
@@ -57,21 +58,28 @@ def main():
 
     if args.method == "list":
         try:
-            list_folder_emails(host, email, password, folder_id, limit)
+            list_folder_emails(host, email, password, folder_path, limit)
         except Exception as e:
             print("[-] List failed:", e)
         return
 
     if args.method == "extract":
         try:
-            extract_folder_emails(host, email, password, folder_id, limit, args.output)
+            extract_folder_emails(host, email, password, folder_path, limit, args.output)
         except Exception as e:
             print("[-] Extract failed:", e)
         return
 
+    if args.method == "watch":
+        try:
+            watch_folder_emails(host, email, password, folder_path, limit, args.output)
+        except Exception as e:
+            print("[-] Watch failed:", e)
+        return
+
     if args.method == "update-splunk":
         try:
-            update_splunk_from_folder(host, email, password, folder_id, limit, config)
+            update_splunk_from_folder(host, email, password, folder_path, limit, config)
         except Exception as e:
             print("[-] Splunk update failed:", e)
         return

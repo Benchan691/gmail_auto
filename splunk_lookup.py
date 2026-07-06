@@ -4,7 +4,7 @@ from urllib.parse import quote, urlparse, urlunparse
 
 from case_parser import parse_case_fields
 from common import config_bool, debug, require_requests
-from zimbra import zimbra_get_folder, zimbra_get_message, zimbra_search, zimbra_soap_login
+from zimbra import zimbra_get_message, zimbra_resolve_folder_path, zimbra_search, zimbra_soap_login
 
 
 def _normalize_url(url: str) -> str:
@@ -199,14 +199,14 @@ def _splunk_update_case(session, settings: dict, update: dict) -> int:
     return match_count
 
 
-def update_splunk_from_folder(host: str, email: str, password: str, folder_id: str, limit: int, config: dict) -> None:
+def update_splunk_from_folder(host: str, email: str, password: str, folder_path: str, limit: int, config: dict) -> None:
     req = require_requests()
     settings = _required_splunk_config(config)
     if not settings["verify_tls"]:
         req.packages.urllib3.disable_warnings()
 
     debug("Starting update-splunk")
-    debug(f"Mail host={host} folder_id={folder_id} limit={limit}")
+    debug(f"Mail host={host} folder_path={folder_path} limit={limit}")
     debug(
         "Splunk target "
         f"rest_url={settings['rest_url']} app={settings['app']} owner={settings['owner']} "
@@ -214,7 +214,8 @@ def update_splunk_from_folder(host: str, email: str, password: str, folder_id: s
     )
 
     token = zimbra_soap_login(host, email, password)
-    folder = zimbra_get_folder(host, token, folder_id)
+    folder = zimbra_resolve_folder_path(host, token, folder_path)
+    folder_id = folder["id"]
     folder_label = f"{folder['name']} ({folder['abs_path']})" if folder else f"id={folder_id}"
     debug(f"Zimbra folder resolved: {folder_label}")
 

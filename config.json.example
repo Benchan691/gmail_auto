@@ -2,7 +2,7 @@
   "host": "zmailbox.example.com",
   "email": "you@example.com",
   "password": "your-password",
-  "folder_id": 373,
+  "folder_path": "Inbox",
   "limit": 10,
   "splunk_web_url": "https://172.16.32.8:8000",
   "splunk_rest_url": "",

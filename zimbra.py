@@ -1,11 +1,11 @@
 import imaplib
-import json
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from pathlib import Path
 
-from case_parser import parse_case_fields, plain_text_body
+from case_parser import case_fields_for_json, parse_case_fields, plain_text_body
 from common import require_requests
+from email_store import email_ids, emails_path, load_emails, merge_new_emails, save_emails
 
 
 def test_imap_login(host: str, email: str, password: str) -> None:
@@ -246,6 +246,41 @@ def zimbra_get_folder(host: str, auth_token: str, folder_id: str):
     return None
 
 
+def zimbra_resolve_folder_path(host: str, auth_token: str, folder_path: str) -> dict:
+    wanted = (folder_path or "").strip().strip("/")
+    if not wanted:
+        raise ValueError("folder_path is required")
+    if wanted.isdigit():
+        folder = zimbra_get_folder(host, auth_token, wanted)
+        if folder:
+            return folder
+
+    folders = zimbra_list_folders(host, auth_token)
+    paths = _folder_path_by_id(folders)
+
+    def clean(value: str) -> str:
+        return (value or "").strip().strip("/").lower()
+
+    exact_hits = [
+        folder
+        for folder in folders
+        if clean(folder.get("abs_path", "")) == clean(wanted) or clean(paths.get(folder["id"], "")) == clean(wanted)
+    ]
+    if len(exact_hits) == 1:
+        return exact_hits[0]
+    if len(exact_hits) > 1:
+        raise RuntimeError(f"Folder path '{folder_path}' matched multiple folders; use the full path")
+
+    name_hits = [folder for folder in folders if clean(folder.get("name", "")) == clean(wanted)]
+    if len(name_hits) == 1:
+        return name_hits[0]
+    if len(name_hits) > 1:
+        choices = ", ".join(paths.get(folder["id"], folder.get("abs_path", "")) for folder in name_hits[:10])
+        raise RuntimeError(f"Folder name '{folder_path}' is ambiguous; use one full path: {choices}")
+
+    raise RuntimeError(f"Folder path not found: {folder_path}")
+
+
 def _extract_message_content(elem) -> dict:
     text_body = ""
     html_body = ""
@@ -336,72 +371,114 @@ def zimbra_get_message(host: str, auth_token: str, message_id: str, include_body
     }
 
 
-def _safe_filename(value: str, max_len: int = 80) -> str:
-    cleaned = "".join(c if c.isalnum() or c in "._- " else "_" for c in value).strip()
-    return (cleaned or "email")[:max_len]
+def message_to_record(host: str, token: str, hit: dict) -> dict:
+    details = zimbra_get_message(host, token, hit["id"], include_body=True) or hit
+    subject = details.get("subject", hit.get("subject", ""))
+    case_fields = parse_case_fields(subject, details.get("body", ""))
+    return case_fields_for_json(
+        case_fields,
+        message_id=details.get("id", hit["id"]),
+        subject=subject,
+    )
 
 
-def extract_folder_emails(host: str, email: str, password: str, folder_id: str, limit: int, output_dir: str = "output") -> None:
+def fetch_folder_records(host: str, token: str, folder_id: str, limit: int) -> list[dict]:
+    hits = zimbra_search(host, token, f"inid:{folder_id}", limit=limit)
+    return [message_to_record(host, token, hit) for hit in hits]
+
+
+def fetch_new_folder_records(host: str, token: str, hits: list[dict], known_ids: set[str], limit: int) -> list[dict]:
+    new_records = []
+    for hit in hits:
+        if hit["id"] in known_ids:
+            break
+        new_records.append(message_to_record(host, token, hit))
+        if len(new_records) >= limit:
+            break
+    return new_records
+
+
+def _print_record(index: int, record: dict) -> None:
+    print(f"\n{index}. id={record['id']}")
+    print(f"   subject:   {record['subject']}")
+    print(f"   case:      {record['case_number']} | status={record['case_status']}")
+    if record["resolution"]:
+        print(f"   resolution: {record['resolution'][:120]}")
+
+
+def extract_folder_emails(host: str, email: str, password: str, folder_path: str, limit: int, output_dir: str = "output") -> None:
     token = zimbra_soap_login(host, email, password)
-    folder = zimbra_get_folder(host, token, folder_id)
+    folder = zimbra_resolve_folder_path(host, token, folder_path)
+    folder_id = folder["id"]
     folder_label = f"{folder['name']} ({folder['abs_path']})" if folder else f"id={folder_id}"
     out_path = Path(output_dir)
     out_path.mkdir(parents=True, exist_ok=True)
 
-    print(f"\n[*] Extracting last {limit} email(s) from folder id={folder_id}")
+    print(f"\n[*] Extracting last {limit} email(s) from folder path={folder_path} (id={folder_id})")
     print(f"    folder: {folder_label}")
     print(f"    output: {out_path.resolve()}")
+
+    extracted = fetch_folder_records(host, token, folder_id, limit)
+    if not extracted:
+        print("[-] No messages found in this folder.")
+        return
+
+    for index, record in enumerate(extracted, start=1):
+        _print_record(index, record)
+
+    summary_path = emails_path(output_dir)
+    save_emails(summary_path, extracted)
+    print(f"\n[+] Extracted {len(extracted)} email(s)")
+    print(f"[+] Saved: {summary_path.resolve()}")
+
+
+def watch_folder_emails(host: str, email: str, password: str, folder_path: str, limit: int, output_dir: str = "output") -> None:
+    token = zimbra_soap_login(host, email, password)
+    folder = zimbra_resolve_folder_path(host, token, folder_path)
+    folder_id = folder["id"]
+    folder_label = f"{folder['name']} ({folder['abs_path']})" if folder else f"id={folder_id}"
+    summary_path = emails_path(output_dir)
+
+    print(f"\n[*] Watching folder path={folder_path} (id={folder_id}, {folder_label})")
+    print(f"    limit: {limit}")
+    print(f"    output: {summary_path.resolve()}")
 
     hits = zimbra_search(host, token, f"inid:{folder_id}", limit=limit)
     if not hits:
         print("[-] No messages found in this folder.")
         return
 
-    extracted = []
-    for index, hit in enumerate(hits, start=1):
-        details = zimbra_get_message(host, token, hit["id"], include_body=True) or hit
-        subject = details.get("subject", hit.get("subject", ""))
-        case_fields = parse_case_fields(subject, details.get("body", ""))
-        record = {
-            "index": index,
-            "id": details.get("id", hit["id"]),
-            "folder_id": details.get("folder_id", hit.get("folder_id", folder_id)),
-            "date": details.get("date", format_date(hit.get("date", ""))),
-            "from": details.get("sender", ""),
-            "from_email": details.get("sender_email", ""),
-            "to": details.get("to", []),
-            "cc": details.get("cc", []),
-            "subject": subject,
-            "case_number": case_fields["case_number"],
-            "case_status": case_fields["case_status"],
-            "resolution": case_fields["resolution"],
-            "body": details.get("body", ""),
-        }
-        extracted.append(record)
+    existing = load_emails(summary_path)
+    if not existing:
+        print("[*] No emails.json yet — fetching up to limit message(s)")
+        records = fetch_folder_records(host, token, folder_id, limit)
+        save_emails(summary_path, records)
+        print(f"[+] Saved {len(records)} email(s) to {summary_path.resolve()}")
+        return
 
-        filename = f"{index:02d}_{_safe_filename(record['date'])}_{_safe_filename(record['subject'])}.txt"
-        file_path = out_path / filename
-        file_path.write_text(record["body"] or "", encoding="utf-8")
+    known_ids = email_ids(existing)
+    if hits[0]["id"] in known_ids:
+        print("[+] 0 new message(s)")
+        return
 
-        print(f"\n{index}. saved {file_path.name}")
-        print(f"   id={record['id']}  date={record['date']}")
-        print(f"   from:    {record['from']}")
-        print(f"   subject: {record['subject']}")
-        print(f"   case:    {record['case_number']} | status={record['case_status']}")
-        if record["resolution"] not in ("N/A", "unrelated"):
-            print(f"   resolution: {record['resolution'][:120]}")
+    new_records = fetch_new_folder_records(host, token, hits, known_ids, limit)
+    if not new_records:
+        print("[+] 0 new message(s)")
+        return
 
-    summary_path = out_path / "emails.json"
-    summary_path.write_text(json.dumps(extracted, indent=2, ensure_ascii=False), encoding="utf-8")
-    print(f"\n[+] Extracted {len(extracted)} email(s)")
-    print(f"[+] Summary: {summary_path.resolve()}")
+    merged = merge_new_emails(existing, new_records, limit)
+    save_emails(summary_path, merged)
+    print(f"[+] {len(new_records)} new message(s), {len(merged)} total in {summary_path.resolve()}")
+    for index, record in enumerate(new_records, start=1):
+        _print_record(index, record)
 
 
-def list_folder_emails(host: str, email: str, password: str, folder_id: str, limit: int) -> None:
+def list_folder_emails(host: str, email: str, password: str, folder_path: str, limit: int) -> None:
     token = zimbra_soap_login(host, email, password)
-    folder = zimbra_get_folder(host, token, folder_id)
+    folder = zimbra_resolve_folder_path(host, token, folder_path)
+    folder_id = folder["id"]
     folder_label = f"{folder['name']} ({folder['abs_path']})" if folder else f"id={folder_id}"
-    print(f"\n[*] Last {limit} email(s) in folder id={folder_id} ({folder_label}), newest first")
+    print(f"\n[*] Last {limit} email(s) in folder path={folder_path} (id={folder_id}, {folder_label}), newest first")
 
     hits = zimbra_search(host, token, f"inid:{folder_id}", limit=limit)
     if not hits:
@@ -410,7 +487,7 @@ def list_folder_emails(host: str, email: str, password: str, folder_id: str, lim
             print("    (folder id=1 is the mailbox root; emails live in subfolders like Inbox=2, Sent=5)")
             message_folders = [f for f in zimbra_list_folders(host, token) if f.get("view") == "message" and f.get("id") != "1"]
             if message_folders:
-                print("\n    Message folders you can set in config.json folder_id:")
+                print("\n    Message folders you can set in config.json folder_path:")
                 for f in message_folders:
                     print(f"      id={f['id']:>2}  {f.get('abs_path') or f.get('name')}")
         return

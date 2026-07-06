@@ -87,3 +87,25 @@ def parse_case_fields(subject: str, body: str) -> dict:
         "case_status": case_status or "N/A",
         "resolution": resolution or "N/A",
     }
+
+
+def case_fields_for_json(case_fields: dict, *, message_id: str = "", subject: str = "") -> dict:
+    def null_if_missing(value):
+        if value is None:
+            return None
+        text = str(value).strip()
+        if not text or text in {"N/A", "unrelated"}:
+            return None
+        return text
+
+    subject_text = (subject or "").strip()
+    if subject_text == "(no subject)":
+        subject_text = ""
+
+    return {
+        "id": (message_id or "").strip() or None,
+        "subject": subject_text or None,
+        "case_number": null_if_missing(case_fields.get("case_number")),
+        "case_status": null_if_missing(case_fields.get("case_status")),
+        "resolution": null_if_missing(case_fields.get("resolution")),
+    }
