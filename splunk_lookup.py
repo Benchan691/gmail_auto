@@ -4,7 +4,7 @@ from urllib.parse import quote, urlparse, urlunparse
 
 from case_parser import parse_case_fields
 from common import config_bool, debug, require_requests
-from zimbra import zimbra_get_message, zimbra_resolve_folder_path, zimbra_search, zimbra_soap_login
+from zimbra import scan_closed_folder_records, zimbra_resolve_folder_path, zimbra_soap_login
 
 
 def _normalize_url(url: str) -> str:
@@ -219,25 +219,28 @@ def update_splunk_from_folder(host: str, email: str, password: str, folder_path:
     folder_label = f"{folder['name']} ({folder['abs_path']})" if folder else f"id={folder_id}"
     debug(f"Zimbra folder resolved: {folder_label}")
 
-    hits = zimbra_search(host, token, f"inid:{folder_id}", limit=limit)
-    debug(f"Zimbra search complete: hits={len(hits)}")
-    if not hits:
-        print("[-] No messages found in this folder.")
+    closed_records = scan_closed_folder_records(host, token, folder_id, limit)
+    debug(f"Zimbra closed scan complete: records={len(closed_records)}")
+    if not closed_records:
+        print("[-] No closed messages found in this folder.")
         return
 
     updates: dict[str, dict] = {}
-    for index, hit in enumerate(hits, start=1):
-        debug(f"Loading message {index}/{len(hits)}: id={hit['id']} subject={hit.get('subject', '')}")
-        details = zimbra_get_message(host, token, hit["id"], include_body=True) or hit
-        case_fields = parse_case_fields(details.get("subject", hit.get("subject", "")), details.get("body", ""))
+    for index, record in enumerate(closed_records, start=1):
+        case_fields = {
+            "case_number": record.get("case_number") or "N/A",
+            "case_status": record.get("case_status") or "N/A",
+            "resolution": record.get("resolution") or "N/A",
+        }
         debug(
-            f"Parsed message id={hit['id']}: case={case_fields['case_number']} "
-            f"status={case_fields['case_status']} resolution_chars={len(case_fields['resolution'])}"
+            f"Parsed closed message {index}/{len(closed_records)}: id={record.get('id')} "
+            f"case={case_fields['case_number']} status={case_fields['case_status']} "
+            f"resolution_chars={len(case_fields['resolution'])}"
         )
 
         update, reason = case_update_from_fields(case_fields)
         if not update:
-            debug(f"Skip message id={hit['id']}: {reason}")
+            debug(f"Skip message id={record.get('id')}: {reason}")
             continue
         if update["case_number"] in updates:
             debug(f"Skip duplicate closed case {update['case_number']}: newest message already queued")

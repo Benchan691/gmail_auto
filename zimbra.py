@@ -196,11 +196,11 @@ def zimbra_list_folders(host: str, auth_token: str) -> list[dict]:
     return folders
 
 
-def zimbra_search(host: str, auth_token: str, query: str, limit: int = 50) -> list[dict]:
+def zimbra_search(host: str, auth_token: str, query: str, limit: int = 50, offset: int = 0) -> list[dict]:
     root = zimbra_soap_request(
         host,
         auth_token,
-        f"""<SearchRequest xmlns="urn:zimbraMail" types="message" sortBy="dateDesc" limit="{limit}">
+        f"""<SearchRequest xmlns="urn:zimbraMail" types="message" sortBy="dateDesc" limit="{limit}" offset="{offset}">
   <query>{query}</query>
 </SearchRequest>""",
     )
@@ -384,20 +384,67 @@ def message_to_record(host: str, token: str, hit: dict) -> dict:
     )
 
 
+def is_closed_record(record: dict) -> bool:
+    return str(record.get("case_status") or "").lower() == "closed"
+
+
+def scan_closed_folder_records(
+    host: str,
+    token: str,
+    folder_id: str,
+    limit: int,
+    *,
+    known_ids=None,
+    stop_at_known: bool = False,
+    scan_batch: int = 50,
+    max_scan: int = 500,
+) -> list[dict]:
+    known = known_ids or set()
+    closed: list[dict] = []
+    seen: set[str] = set()
+    offset = 0
+    query = f"inid:{folder_id}"
+
+    while offset < max_scan:
+        hits = zimbra_search(host, token, query, limit=scan_batch, offset=offset)
+        if not hits:
+            break
+
+        for hit in hits:
+            if stop_at_known and hit["id"] in known:
+                return closed
+
+            record = message_to_record(host, token, hit)
+            if not is_closed_record(record):
+                continue
+
+            record_id = record.get("id")
+            if record_id and record_id in seen:
+                continue
+            if record_id:
+                seen.add(str(record_id))
+
+            closed.append(record)
+            if not stop_at_known and len(closed) >= limit:
+                return closed
+
+        offset += len(hits)
+        if len(hits) < scan_batch:
+            break
+
+    return closed
+
+
 def fetch_folder_records(host: str, token: str, folder_id: str, limit: int) -> list[dict]:
-    hits = zimbra_search(host, token, f"inid:{folder_id}", limit=limit)
-    return [message_to_record(host, token, hit) for hit in hits]
+    return scan_closed_folder_records(host, token, folder_id, limit)
 
 
-def fetch_new_folder_records(host: str, token: str, hits: list[dict], known_ids: set[str], limit: int) -> list[dict]:
-    new_records = []
-    for hit in hits:
-        if hit["id"] in known_ids:
-            break
-        new_records.append(message_to_record(host, token, hit))
-        if len(new_records) >= limit:
-            break
-    return new_records
+def fetch_new_closed_folder_records(
+    host: str, token: str, folder_id: str, known_ids: set[str], limit: int
+) -> list[dict]:
+    return scan_closed_folder_records(
+        host, token, folder_id, limit, known_ids=known_ids, stop_at_known=True
+    )
 
 
 def _print_record(index: int, record: dict) -> None:
@@ -416,13 +463,13 @@ def extract_folder_emails(host: str, email: str, password: str, folder_path: str
     out_path = Path(output_dir)
     out_path.mkdir(parents=True, exist_ok=True)
 
-    print(f"\n[*] Extracting last {limit} email(s) from folder path={folder_path} (id={folder_id})")
+    print(f"\n[*] Extracting last {limit} closed email(s) from folder path={folder_path} (id={folder_id})")
     print(f"    folder: {folder_label}")
     print(f"    output: {out_path.resolve()}")
 
     extracted = fetch_folder_records(host, token, folder_id, limit)
     if not extracted:
-        print("[-] No messages found in this folder.")
+        print("[-] No closed messages found in this folder.")
         return
 
     for index, record in enumerate(extracted, start=1):
@@ -430,7 +477,7 @@ def extract_folder_emails(host: str, email: str, password: str, folder_path: str
 
     summary_path = emails_path(output_dir)
     save_emails(summary_path, extracted)
-    print(f"\n[+] Extracted {len(extracted)} email(s)")
+    print(f"\n[+] Extracted {len(extracted)} closed email(s)")
     print(f"[+] Saved: {summary_path.resolve()}")
 
 
@@ -442,35 +489,29 @@ def watch_folder_emails(host: str, email: str, password: str, folder_path: str, 
     summary_path = emails_path(output_dir)
 
     print(f"\n[*] Watching folder path={folder_path} (id={folder_id}, {folder_label})")
-    print(f"    limit: {limit}")
+    print(f"    closed limit: {limit}")
     print(f"    output: {summary_path.resolve()}")
-
-    hits = zimbra_search(host, token, f"inid:{folder_id}", limit=limit)
-    if not hits:
-        print("[-] No messages found in this folder.")
-        return
 
     existing = load_emails(summary_path)
     if not existing:
-        print("[*] No emails.json yet — fetching up to limit message(s)")
+        print("[*] No emails.json yet — fetching up to limit closed message(s)")
         records = fetch_folder_records(host, token, folder_id, limit)
+        if not records:
+            print("[-] No closed messages found in this folder.")
+            return
         save_emails(summary_path, records)
-        print(f"[+] Saved {len(records)} email(s) to {summary_path.resolve()}")
+        print(f"[+] Saved {len(records)} closed email(s) to {summary_path.resolve()}")
         return
 
     known_ids = email_ids(existing)
-    if hits[0]["id"] in known_ids:
-        print("[+] 0 new message(s)")
-        return
-
-    new_records = fetch_new_folder_records(host, token, hits, known_ids, limit)
+    new_records = fetch_new_closed_folder_records(host, token, folder_id, known_ids, limit)
     if not new_records:
-        print("[+] 0 new message(s)")
+        print("[+] 0 new closed message(s)")
         return
 
     merged = merge_new_emails(existing, new_records, limit)
     save_emails(summary_path, merged)
-    print(f"[+] {len(new_records)} new message(s), {len(merged)} total in {summary_path.resolve()}")
+    print(f"[+] {len(new_records)} new closed message(s), {len(merged)} total in {summary_path.resolve()}")
     for index, record in enumerate(new_records, start=1):
         _print_record(index, record)
 
