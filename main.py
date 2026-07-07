@@ -1,7 +1,7 @@
 import argparse
 
 from common import CONFIG_PATH, load_config
-from splunk_lookup import run_self_test, update_splunk_from_folder
+from splunk_lookup import reorder_splunk_lookup, run_self_test, update_splunk_from_folder
 from zimbra import (
     find_cust_g50095,
     list_folder_emails,
@@ -17,9 +17,9 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--method",
-        choices=["imap", "soap", "both", "find", "list", "watch", "sync", "update-splunk"],
+        choices=["imap", "soap", "both", "find", "list", "watch", "sync", "update-splunk", "reorder-splunk"],
         default="both",
-        help="Login/test, find, list/watch/sync emails, or update Splunk lookup",
+        help="Login/test, find, list/watch/sync emails, update/reorder Splunk lookup",
     )
     parser.add_argument(
         "--self-test",
@@ -29,6 +29,8 @@ def main():
     parser.add_argument("--config", default=CONFIG_PATH, help="Path to config.json")
     parser.add_argument("--folder-path", type=str, help="Folder path to read emails from (overrides config folder_path)")
     parser.add_argument("--limit", type=int, help="Number of recent emails to list (overrides config limit)")
+    parser.add_argument("--lookup-name", type=str, help="Splunk lookup CSV filename for --method reorder-splunk")
+
     parser.add_argument("--output", default="output", help="Output directory for --method sync or watch")
 
     args = parser.parse_args()
@@ -82,6 +84,16 @@ def main():
             update_splunk_from_folder(host, email, password, folder_path, limit, config)
         except Exception as e:
             print("[-] Splunk update failed:", e)
+        return
+
+    if args.method == "reorder-splunk":
+        if not args.lookup_name:
+            print("[-] --lookup-name is required for --method reorder-splunk (e.g. G50095_Ticket_Status.csv)")
+            return
+        try:
+            reorder_splunk_lookup(args.lookup_name, config)
+        except Exception as e:
+            print("[-] Splunk reorder failed:", e)
         return
 
     if args.method in ["soap", "both"]:

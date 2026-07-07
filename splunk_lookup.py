@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import csv
+import io
 import json
 import time
 from urllib.parse import quote, urlparse, urlunparse
@@ -59,6 +61,96 @@ def lookup_name_from_case_number(case_number: str) -> str:
 
 
 SPLUNK_LOOKUP_COLUMNS = ("TicketNumber", "Severity", "Status", "Remark", "Matrix", "Actionable")
+
+
+def _lookup_table_path(settings: dict, lookup_name: str) -> str:
+    return (
+        f"/servicesNS/{quote(settings['owner'], safe='')}/"
+        f"{quote(settings['app'], safe='')}/data/lookup-table-files/"
+        f"{quote(lookup_name, safe='')}"
+    )
+
+
+def _rows_to_lookup_csv(rows: list[dict], columns: tuple[str, ...] = SPLUNK_LOOKUP_COLUMNS) -> str:
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=columns, extrasaction="ignore", lineterminator="\n")
+    writer.writeheader()
+    for row in rows:
+        writer.writerow({col: "" if row.get(col) is None else str(row.get(col, "")) for col in columns})
+    return buf.getvalue()
+
+
+def _splunk_fetch_lookup_rows(session, settings: dict, lookup_name: str) -> list[dict]:
+    search = f"| inputlookup {_splunk_literal(lookup_name)}"
+    rows = _splunk_run_search(session, settings, search, f"fetch {lookup_name}", want_results=True)
+    debug(f"Fetched lookup rows: lookup={lookup_name} rows={len(rows)}")
+    return rows
+
+
+def _splunk_upload_lookup_csv(session, settings: dict, lookup_name: str, csv_text: str) -> None:
+    path = _lookup_table_path(settings, lookup_name)
+    response = session.post(
+        f"{settings['rest_url']}{path}",
+        params={"output_mode": "json"},
+        files={"eai:data": (lookup_name, csv_text.encode("utf-8"), "text/csv")},
+        auth=(settings["username"], settings["password"]),
+        verify=settings["verify_tls"],
+        timeout=60,
+    )
+    debug(f"Splunk POST {path}: HTTP {response.status_code}")
+    if response.status_code >= 400:
+        raise RuntimeError(f"Splunk lookup upload failed: HTTP {response.status_code}\n{response.text[:1500]}")
+
+
+def _apply_case_update(row: dict, case_number: str, resolution: str) -> dict:
+    updated = dict(row)
+    updated["Status"] = "Resolved"
+    updated["Remark"] = resolution
+    updated["Matrix"] = "False Positive"
+    return updated
+
+
+def reorder_splunk_lookup(lookup_name: str, config: dict) -> None:
+    req = require_requests()
+    settings = _required_splunk_config(config)
+    if not settings["verify_tls"]:
+        req.packages.urllib3.disable_warnings()
+
+    session = req.Session()
+    rows = _splunk_fetch_lookup_rows(session, settings, lookup_name)
+    if not rows:
+        print(f"[-] Lookup {lookup_name} is empty or not found.")
+        return
+
+    _splunk_upload_lookup_csv(session, settings, lookup_name, _rows_to_lookup_csv(rows))
+    print(f"[+] Reordered columns in {lookup_name} to: {', '.join(SPLUNK_LOOKUP_COLUMNS)}")
+
+
+def _splunk_update_lookup_cases(session, settings: dict, lookup_name: str, case_updates: dict[str, str]) -> int:
+    rows = _splunk_fetch_lookup_rows(session, settings, lookup_name)
+    if not rows:
+        print(f"[-] Lookup {lookup_name} is empty or not found.")
+        return 0
+
+    matched: set[str] = set()
+    new_rows: list[dict] = []
+    for row in rows:
+        ticket = str(row.get("TicketNumber", "")).strip()
+        if ticket in case_updates:
+            new_rows.append(_apply_case_update(row, ticket, case_updates[ticket]))
+            matched.add(ticket)
+        else:
+            new_rows.append(row)
+
+    if not matched:
+        tickets = ", ".join(sorted(case_updates))
+        print(f"[-] No lookup row matched TicketNumber(s) {tickets} in {lookup_name}; skipped")
+        return 0
+
+    _splunk_upload_lookup_csv(session, settings, lookup_name, _rows_to_lookup_csv(new_rows))
+    for ticket in sorted(matched):
+        print(f"[+] Updated TicketNumber={ticket} in {lookup_name}")
+    return len(matched)
 
 
 def _splunk_literal(value: str) -> str:
@@ -161,9 +253,9 @@ def case_update_from_fields(case_fields: dict) -> tuple[dict | None, str]:
 
 
 def build_splunk_update_search(lookup_name: str, case_number: str, resolution: str) -> str:
+    """Legacy SPL builder kept for self-test reference; updates use REST CSV upload."""
     ticket = _splunk_literal(case_number)
-    columns = " ".join(SPLUNK_LOOKUP_COLUMNS)
-    # ponytail: whole-lookup writes are fine for manual runs; add locking if this becomes a poller.
+    columns = ", ".join(SPLUNK_LOOKUP_COLUMNS)
     return "\n".join(
         [
             f"| inputlookup {_splunk_literal(lookup_name)}",
@@ -184,15 +276,7 @@ def _splunk_update_case(session, settings: dict, update: dict) -> int:
         print(f"[-] Skip TicketNumber={case_number}: {e}")
         return 0
 
-    _splunk_run_search(
-        session,
-        settings,
-        build_splunk_update_search(lookup_name, case_number, update["resolution"]),
-        f"update {case_number}",
-        want_results=False,
-    )
-    print(f"[+] Updated TicketNumber={case_number} in {lookup_name}")
-    return 1
+    return _splunk_update_lookup_cases(session, settings, lookup_name, {case_number: update["resolution"]})
 
 
 def update_splunk_from_records(records: list[dict], config: dict) -> int:
@@ -241,9 +325,14 @@ def update_splunk_from_records(records: list[dict], config: dict) -> int:
 
     debug(f"Connecting to Splunk REST for {len(updates)} queued case update(s)")
     session = req.Session()
-    total_rows = 0
+    by_lookup: dict[str, dict[str, str]] = {}
     for update in updates.values():
-        total_rows += _splunk_update_case(session, settings, update)
+        lookup_name = lookup_name_from_case_number(update["case_number"])
+        by_lookup.setdefault(lookup_name, {})[update["case_number"]] = update["resolution"]
+
+    total_rows = 0
+    for lookup_name, case_updates in by_lookup.items():
+        total_rows += _splunk_update_lookup_cases(session, settings, lookup_name, case_updates)
 
     print(f"[+] Done. Cases queued={len(updates)} lookup rows updated={total_rows}")
     return total_rows
@@ -304,7 +393,21 @@ Second line "quoted"
     assert 'Status=if(TicketNumber="1234567890", "Resolved", Status)' in search
     assert 'Remark=if(TicketNumber="1234567890",' in search
     assert 'Matrix=if(TicketNumber="1234567890", "False Positive", Matrix)' in search
-    assert "| table TicketNumber Severity Status Remark Matrix Actionable" in search
+    assert "| table TicketNumber, Severity, Status, Remark, Matrix, Actionable" in search
     assert "Actionable=if" not in search
     assert 'First line\\nSecond line \\"quoted\\"' in search
+
+    csv_text = _rows_to_lookup_csv(
+        [
+            {
+                "TicketNumber": "1",
+                "Severity": "High",
+                "Status": "Open",
+                "Remark": "note",
+                "Matrix": "True Positive",
+                "Actionable": "yes",
+            }
+        ]
+    )
+    assert csv_text.splitlines()[0] == "TicketNumber,Severity,Status,Remark,Matrix,Actionable"
     print("[+] Self-test passed")
