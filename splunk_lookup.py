@@ -58,6 +58,9 @@ def lookup_name_from_case_number(case_number: str) -> str:
     return f"G{digits[:5]}_Ticket_Status.csv"
 
 
+SPLUNK_LOOKUP_COLUMNS = ("TicketNumber", "Severity", "Status", "Remark", "Matrix", "Actionable")
+
+
 def _splunk_literal(value: str) -> str:
     return json.dumps(str(value), ensure_ascii=False)
 
@@ -157,23 +160,17 @@ def case_update_from_fields(case_fields: dict) -> tuple[dict | None, str]:
     return {"case_number": case_number, "resolution": resolution}, "queued"
 
 
-def build_splunk_count_search(lookup_name: str, case_number: str) -> str:
-    return (
-        f"| inputlookup {_splunk_literal(lookup_name)} "
-        f"| search TicketNumber={_splunk_literal(case_number)} "
-        "| stats count as count"
-    )
-
-
 def build_splunk_update_search(lookup_name: str, case_number: str, resolution: str) -> str:
     ticket = _splunk_literal(case_number)
+    columns = " ".join(SPLUNK_LOOKUP_COLUMNS)
     # ponytail: whole-lookup writes are fine for manual runs; add locking if this becomes a poller.
     return "\n".join(
         [
             f"| inputlookup {_splunk_literal(lookup_name)}",
             f"| eval Status=if(TicketNumber={ticket}, {_splunk_literal('Resolved')}, Status)",
+            f"| eval Remark=if(TicketNumber={ticket}, {_splunk_literal(resolution)}, Remark)",
             f"| eval Matrix=if(TicketNumber={ticket}, {_splunk_literal('False Positive')}, Matrix)",
-            f"| eval Actionable=if(TicketNumber={ticket}, {_splunk_literal(resolution)}, Actionable)",
+            f"| table {columns}",
             f"| outputlookup {_splunk_literal(lookup_name)}",
         ]
     )
@@ -187,19 +184,6 @@ def _splunk_update_case(session, settings: dict, update: dict) -> int:
         print(f"[-] Skip TicketNumber={case_number}: {e}")
         return 0
 
-    rows = _splunk_run_search(
-        session,
-        settings,
-        build_splunk_count_search(lookup_name, case_number),
-        f"count {case_number}",
-        want_results=True,
-    )
-    match_count = int((rows[0] if rows else {}).get("count") or 0)
-    debug(f"Splunk lookup match count: lookup={lookup_name} TicketNumber={case_number} rows={match_count}")
-    if match_count == 0:
-        print(f"[-] No lookup row matched TicketNumber={case_number} in {lookup_name}; skipped")
-        return 0
-
     _splunk_run_search(
         session,
         settings,
@@ -207,8 +191,8 @@ def _splunk_update_case(session, settings: dict, update: dict) -> int:
         f"update {case_number}",
         want_results=False,
     )
-    print(f"[+] Updated TicketNumber={case_number} in {lookup_name}: rows={match_count}")
-    return match_count
+    print(f"[+] Updated TicketNumber={case_number} in {lookup_name}")
+    return 1
 
 
 def update_splunk_from_records(records: list[dict], config: dict) -> int:
@@ -248,7 +232,7 @@ def update_splunk_from_records(records: list[dict], config: dict) -> int:
         updates[update["case_number"]] = update
         debug(
             f"Queued update: TicketNumber={update['case_number']} lookup={lookup_name} "
-            f"Actionable chars={len(update['resolution'])}"
+            f"Remark chars={len(update['resolution'])}"
         )
 
     if not updates:
@@ -318,6 +302,9 @@ Second line "quoted"
     search = build_splunk_update_search(lookup_name, update["case_number"], update["resolution"])
     assert 'inputlookup "G12345_Ticket_Status.csv"' in search
     assert 'Status=if(TicketNumber="1234567890", "Resolved", Status)' in search
+    assert 'Remark=if(TicketNumber="1234567890",' in search
     assert 'Matrix=if(TicketNumber="1234567890", "False Positive", Matrix)' in search
+    assert "| table TicketNumber Severity Status Remark Matrix Actionable" in search
+    assert "Actionable=if" not in search
     assert 'First line\\nSecond line \\"quoted\\"' in search
     print("[+] Self-test passed")
