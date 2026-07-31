@@ -1,4 +1,5 @@
 config.json
+.env
 output/
 attachments/
 __pycache__/
