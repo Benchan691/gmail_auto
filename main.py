@@ -1,6 +1,6 @@
 import argparse
 
-from common import CONFIG_PATH, load_config
+from common import CONFIG_PATH, config_bool, load_config
 from splunk_lookup import run_self_test, update_splunk_from_folder
 from zimbra import (
     find_cust_g50095,
@@ -45,6 +45,7 @@ def main():
     password = config["password"]
     folder_path = str(args.folder_path if args.folder_path is not None else config.get("folder_path", "Inbox"))
     limit = args.limit if args.limit is not None else int(config.get("limit", 10))
+    stop_at_known = config_bool(config, "stop_at_known", True)
 
     if args.method == "find":
         try:
@@ -62,7 +63,9 @@ def main():
 
     if args.method == "watch":
         try:
-            watch_folder_emails(host, email, password, folder_path, limit, args.output)
+            watch_folder_emails(
+                host, email, password, folder_path, limit, args.output, stop_at_known=stop_at_known
+            )
         except Exception as e:
             print("[-] Watch failed:", e)
         return

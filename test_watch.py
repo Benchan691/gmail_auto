@@ -203,6 +203,36 @@ class TestScanClosedFolderRecords(unittest.TestCase):
 
         self.assertEqual([r["id"] for r in result], ["closed-new"])
 
+    def test_continues_past_known_when_stop_disabled(self):
+        hits = [
+            {"id": "open-yes", "actionable": "Yes", "case_number": "500952026070510025941"},
+            {"id": "closed-known"},
+            {"id": "open-no", "actionable": "No", "case_number": "500952026070510025942"},
+        ]
+
+        def search(host, token, query, limit=50, offset=0):
+            return hits[offset : offset + limit]
+
+        import zimbra as zimbra_module
+
+        with patch.object(zimbra_module, "zimbra_search", side_effect=search):
+            with patch.object(zimbra_module, "message_to_record", side_effect=lambda h, t, hit: self._fake_record(hit)):
+                closed, actionable = scan_folder_records(
+                    "h",
+                    "t",
+                    "373",
+                    10,
+                    known_ids={"closed-known"},
+                    stop_at_known=False,
+                    scan_batch=10,
+                )
+
+        self.assertEqual(closed, [])
+        self.assertEqual(
+            [(r["id"], r["actionable"]) for r in actionable],
+            [("open-yes", "Yes"), ("open-no", "No")],
+        )
+
     def test_paginates_until_total_message_limit(self):
         batch1 = [{"id": f"open{i}"} for i in range(3)]
         batch2 = [{"id": "closed1"}, {"id": "closed2"}]
@@ -270,7 +300,9 @@ class TestSyncFolderEmails(unittest.TestCase):
 
         sync_folder_emails("host", "user@example.com", "pass", "373", 10, "output", {})
 
-        mock_collect.assert_called_once_with("host", "token", "373", "output", 10)
+        mock_collect.assert_called_once_with(
+            "host", "token", "373", "output", 10, stop_at_known=True
+        )
         mock_save.assert_called_once_with("output", new_records, 10)
         mock_splunk.assert_called_once_with(new_records, {})
         mock_actionable.assert_not_called()

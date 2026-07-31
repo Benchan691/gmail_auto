@@ -529,6 +529,13 @@ def scan_folder_records(
                 continue
 
             record_id = record.get("id")
+            if record_id and str(record_id) in known:
+                skipped_dup += 1
+                _filter_log(
+                    f"SKIP id={hit_id} case={case_number} status={status!r} "
+                    f"subject={subject!r} reason=known_closed examined={examined}/{total_limit}"
+                )
+                continue
             if record_id and record_id in seen_closed:
                 skipped_dup += 1
                 _filter_log(
@@ -600,14 +607,28 @@ def _print_record(index: int, record: dict) -> None:
 
 
 def collect_new_closed_records(
-    host: str, token: str, folder_id: str, output_dir: str, limit: int
+    host: str,
+    token: str,
+    folder_id: str,
+    output_dir: str,
+    limit: int,
+    *,
+    stop_at_known: bool = True,
 ) -> list[dict]:
-    closed, _actionable = collect_sync_records(host, token, folder_id, output_dir, limit)
+    closed, _actionable = collect_sync_records(
+        host, token, folder_id, output_dir, limit, stop_at_known=stop_at_known
+    )
     return closed
 
 
 def collect_sync_records(
-    host: str, token: str, folder_id: str, output_dir: str, limit: int
+    host: str,
+    token: str,
+    folder_id: str,
+    output_dir: str,
+    limit: int,
+    *,
+    stop_at_known: bool = True,
 ) -> tuple[list[dict], list[dict]]:
     summary_path = emails_path(output_dir)
     existing = load_emails(summary_path)
@@ -616,7 +637,12 @@ def collect_sync_records(
 
     known_ids = email_ids(existing)
     return scan_folder_records(
-        host, token, folder_id, limit, known_ids=known_ids, stop_at_known=True
+        host,
+        token,
+        folder_id,
+        limit,
+        known_ids=known_ids,
+        stop_at_known=stop_at_known,
     )
 
 
@@ -633,7 +659,16 @@ def save_new_closed_records(output_dir: str, new_records: list[dict], limit: int
     return len(merged)
 
 
-def watch_folder_emails(host: str, email: str, password: str, folder_path: str, limit: int, output_dir: str = "output") -> None:
+def watch_folder_emails(
+    host: str,
+    email: str,
+    password: str,
+    folder_path: str,
+    limit: int,
+    output_dir: str = "output",
+    *,
+    stop_at_known: bool = True,
+) -> None:
     token = zimbra_soap_login(host, email, password)
     folder = zimbra_resolve_folder_path(host, token, folder_path)
     folder_id = folder["id"]
@@ -642,13 +677,16 @@ def watch_folder_emails(host: str, email: str, password: str, folder_path: str, 
 
     print(f"\n[*] Watching folder path={folder_path} (id={folder_id}, {folder_label})")
     print(f"    message limit: {limit} (newest total; keep Closed from those)")
+    print(f"    stop_at_known: {stop_at_known}")
     print(f"    output: {summary_path.resolve()}")
 
     existing = load_emails(summary_path)
     if not existing:
         print("[*] No emails.json yet — scanning up to limit newest message(s)")
 
-    new_records = collect_new_closed_records(host, token, folder_id, output_dir, limit)
+    new_records = collect_new_closed_records(
+        host, token, folder_id, output_dir, limit, stop_at_known=stop_at_known
+    )
     if not new_records:
         if existing:
             print("[+] 0 new closed message(s)")
@@ -675,7 +713,10 @@ def sync_folder_emails(
     output_dir: str,
     config: dict,
 ) -> None:
+    from common import config_bool
     from splunk_lookup import update_splunk_actionable_from_records, update_splunk_from_records
+
+    stop_at_known = config_bool(config, "stop_at_known", True)
 
     token = zimbra_soap_login(host, email, password)
     folder = zimbra_resolve_folder_path(host, token, folder_path)
@@ -685,13 +726,16 @@ def sync_folder_emails(
 
     print(f"\n[*] Syncing folder path={folder_path} (id={folder_id}, {folder_label})")
     print(f"    message limit: {limit} (newest total; keep Closed + actionable from those)")
+    print(f"    stop_at_known: {stop_at_known}")
     print(f"    output: {summary_path.resolve()}")
 
     existing = load_emails(summary_path)
     if not existing:
         print("[*] No emails.json yet — scanning up to limit newest message(s)")
 
-    new_records, actionable_records = collect_sync_records(host, token, folder_id, output_dir, limit)
+    new_records, actionable_records = collect_sync_records(
+        host, token, folder_id, output_dir, limit, stop_at_known=stop_at_known
+    )
     if not new_records and not actionable_records:
         print("[+] 0 new closed message(s), 0 actionable message(s)")
         return
