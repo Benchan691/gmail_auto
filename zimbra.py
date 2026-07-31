@@ -1,9 +1,13 @@
+import re
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
+from typing import Optional
 
 from case_parser import case_fields_for_json, parse_case_fields, plain_text_body
 from common import require_requests
 from email_store import email_ids, emails_path, load_emails, merge_new_emails, save_emails
+
+IT_SUPPORT_EMAIL = "it.support@kaitaksportspark.com.hk"
 
 
 def zimbra_soap_login(host: str, email: str, password: str) -> str:
@@ -359,22 +363,74 @@ def message_to_record(host: str, token: str, hit: dict) -> dict:
     details = zimbra_get_message(host, token, hit["id"], include_body=True) or hit
     subject = details.get("subject", hit.get("subject", ""))
     case_fields = parse_case_fields(subject, details.get("body", ""))
-    return case_fields_for_json(
+    record = case_fields_for_json(
         case_fields,
         message_id=details.get("id", hit["id"]),
         subject=subject,
     )
+    # In-memory only — stripped before emails.json persistence.
+    record["to"] = details.get("to") or []
+    return record
+
+
+def record_for_json(record: dict) -> dict:
+    return {
+        "id": record.get("id"),
+        "subject": record.get("subject"),
+        "case_number": record.get("case_number"),
+        "case_status": record.get("case_status"),
+        "resolution": record.get("resolution"),
+    }
 
 
 def is_closed_record(record: dict) -> bool:
     return str(record.get("case_status") or "").lower() == "closed"
 
 
+def is_trustcsi_reply_subject(subject: str) -> bool:
+    text = subject or ""
+    if not re.search(r"(?i)\bre:", text):
+        return False
+    return bool(re.search(r"(?i)TrustCSI Security Incident Notification", text))
+
+
+def has_it_support_recipient(to_list) -> bool:
+    target = IT_SUPPORT_EMAIL.lower()
+    for entry in to_list or []:
+        if not isinstance(entry, dict):
+            continue
+        email = str(entry.get("email") or "").strip().lower()
+        if email == target:
+            return True
+    return False
+
+
+def is_actionable_candidate(record: dict) -> bool:
+    return actionable_flag_for_record(record) is not None
+
+
+def actionable_flag_for_record(record: dict) -> Optional[str]:
+    """Return Actionable value for non-Closed TrustCSI replies, else None.
+
+    - To includes IT Support → "Yes"
+    - TrustCSI reply with case number but no IT Support in To → "No"
+    - Closed / unrelated / non-matching subject → None (do not update Actionable)
+    """
+    if is_closed_record(record):
+        return None
+    case_number = str(record.get("case_number") or "").strip()
+    if not case_number or case_number in {"N/A", "unrelated"}:
+        return None
+    if not is_trustcsi_reply_subject(record.get("subject") or ""):
+        return None
+    return "Yes" if has_it_support_recipient(record.get("to")) else "No"
+
+
 def _filter_log(message: str) -> None:
     print(f"[filter] {message}")
 
 
-def scan_closed_folder_records(
+def scan_folder_records(
     host: str,
     token: str,
     folder_id: str,
@@ -383,15 +439,18 @@ def scan_closed_folder_records(
     known_ids=None,
     stop_at_known: bool = False,
     scan_batch: int = 50,
-) -> list[dict]:
-    """Scan newest messages in a folder; keep Closed ones.
+) -> tuple[list[dict], list[dict]]:
+    """Scan newest messages; return (closed, actionable) from the same pass.
 
-    ``limit`` is the max number of messages examined (any status), newest first —
-    not the number of Closed emails to collect.
+    ``limit`` is the max number of messages examined (any status), newest first.
+    Actionable updates = non-Closed TrustCSI replies with a usable case number
+    (Yes if To includes IT Support, otherwise No).
     """
     known = known_ids or set()
     closed: list[dict] = []
-    seen: set[str] = set()
+    actionable: list[dict] = []
+    seen_closed: set[str] = set()
+    seen_actionable_cases: set[str] = set()
     offset = 0
     query = f"inid:{folder_id}"
     examined = 0
@@ -405,8 +464,8 @@ def scan_closed_folder_records(
     )
 
     if total_limit <= 0:
-        _filter_log("done examined=0 kept=0 (limit=0)")
-        return closed
+        _filter_log("done examined=0 kept=0 actionable=0 (limit=0)")
+        return closed, actionable
 
     while examined < total_limit:
         batch_size = min(scan_batch, total_limit - examined)
@@ -428,25 +487,46 @@ def scan_closed_folder_records(
             if stop_at_known and hit_id in known:
                 _filter_log(
                     f"STOP at known id={hit_id} subject={hit_subject!r} "
-                    f"(examined={examined}/{total_limit} kept={len(closed)} skipped_open={skipped_open})"
+                    f"(examined={examined}/{total_limit} kept={len(closed)} "
+                    f"actionable={len(actionable)} skipped_open={skipped_open})"
                 )
-                return closed
+                return closed, actionable
 
             record = message_to_record(host, token, hit)
             status = record.get("case_status")
             case_number = record.get("case_number")
             subject = (record.get("subject") or hit_subject or "")[:80]
+            actionable_flag = actionable_flag_for_record(record)
+
+            if actionable_flag is not None:
+                case_key = str(case_number).strip()
+                if case_key not in seen_actionable_cases:
+                    seen_actionable_cases.add(case_key)
+                    record["actionable"] = actionable_flag
+                    actionable.append(record)
+                    _filter_log(
+                        f"ACTIONABLE={actionable_flag} id={hit_id} case={case_number} "
+                        f"status={status!r} subject={subject!r} actionable={len(actionable)} "
+                        f"examined={examined}/{total_limit}"
+                    )
+                else:
+                    _filter_log(
+                        f"SKIP id={hit_id} case={case_number} status={status!r} "
+                        f"subject={subject!r} reason=actionable_duplicate "
+                        f"examined={examined}/{total_limit}"
+                    )
 
             if not is_closed_record(record):
                 skipped_open += 1
-                _filter_log(
-                    f"SKIP id={hit_id} case={case_number} status={status!r} "
-                    f"subject={subject!r} reason=not_closed examined={examined}/{total_limit}"
-                )
+                if actionable_flag is None:
+                    _filter_log(
+                        f"SKIP id={hit_id} case={case_number} status={status!r} "
+                        f"subject={subject!r} reason=not_closed examined={examined}/{total_limit}"
+                    )
                 continue
 
             record_id = record.get("id")
-            if record_id and record_id in seen:
+            if record_id and record_id in seen_closed:
                 skipped_dup += 1
                 _filter_log(
                     f"SKIP id={hit_id} case={case_number} status={status!r} "
@@ -454,7 +534,7 @@ def scan_closed_folder_records(
                 )
                 continue
             if record_id:
-                seen.add(str(record_id))
+                seen_closed.add(str(record_id))
 
             closed.append(record)
             _filter_log(
@@ -468,7 +548,30 @@ def scan_closed_folder_records(
 
     _filter_log(
         f"done examined={examined}/{total_limit} kept={len(closed)} "
-        f"skipped_open={skipped_open} skipped_dup={skipped_dup}"
+        f"actionable={len(actionable)} skipped_open={skipped_open} skipped_dup={skipped_dup}"
+    )
+    return closed, actionable
+
+
+def scan_closed_folder_records(
+    host: str,
+    token: str,
+    folder_id: str,
+    limit: int,
+    *,
+    known_ids=None,
+    stop_at_known: bool = False,
+    scan_batch: int = 50,
+) -> list[dict]:
+    """Scan newest messages in a folder; keep Closed ones."""
+    closed, _actionable = scan_folder_records(
+        host,
+        token,
+        folder_id,
+        limit,
+        known_ids=known_ids,
+        stop_at_known=stop_at_known,
+        scan_batch=scan_batch,
     )
     return closed
 
@@ -489,30 +592,40 @@ def _print_record(index: int, record: dict) -> None:
     print(f"\n{index}. id={record['id']}")
     print(f"   subject:   {record['subject']}")
     print(f"   case:      {record['case_number']} | status={record['case_status']}")
-    if record["resolution"]:
+    if record.get("resolution"):
         print(f"   resolution: {record['resolution'][:120]}")
 
 
 def collect_new_closed_records(
     host: str, token: str, folder_id: str, output_dir: str, limit: int
 ) -> list[dict]:
+    closed, _actionable = collect_sync_records(host, token, folder_id, output_dir, limit)
+    return closed
+
+
+def collect_sync_records(
+    host: str, token: str, folder_id: str, output_dir: str, limit: int
+) -> tuple[list[dict], list[dict]]:
     summary_path = emails_path(output_dir)
     existing = load_emails(summary_path)
     if not existing:
-        return fetch_folder_records(host, token, folder_id, limit)
+        return scan_folder_records(host, token, folder_id, limit)
 
     known_ids = email_ids(existing)
-    return fetch_new_closed_folder_records(host, token, folder_id, known_ids, limit)
+    return scan_folder_records(
+        host, token, folder_id, limit, known_ids=known_ids, stop_at_known=True
+    )
 
 
 def save_new_closed_records(output_dir: str, new_records: list[dict], limit: int) -> int:
     summary_path = emails_path(output_dir)
+    persistable = [record_for_json(record) for record in new_records]
     existing = load_emails(summary_path)
     if not existing:
-        save_emails(summary_path, new_records)
-        return len(new_records)
+        save_emails(summary_path, persistable)
+        return len(persistable)
 
-    merged = merge_new_emails(existing, new_records, limit)
+    merged = merge_new_emails(existing, persistable, limit)
     save_emails(summary_path, merged)
     return len(merged)
 
@@ -559,7 +672,7 @@ def sync_folder_emails(
     output_dir: str,
     config: dict,
 ) -> None:
-    from splunk_lookup import update_splunk_from_records
+    from splunk_lookup import update_splunk_actionable_from_records, update_splunk_from_records
 
     token = zimbra_soap_login(host, email, password)
     folder = zimbra_resolve_folder_path(host, token, folder_path)
@@ -568,26 +681,44 @@ def sync_folder_emails(
     summary_path = emails_path(output_dir)
 
     print(f"\n[*] Syncing folder path={folder_path} (id={folder_id}, {folder_label})")
-    print(f"    message limit: {limit} (newest total; keep Closed from those)")
+    print(f"    message limit: {limit} (newest total; keep Closed + actionable from those)")
     print(f"    output: {summary_path.resolve()}")
 
     existing = load_emails(summary_path)
     if not existing:
         print("[*] No emails.json yet — scanning up to limit newest message(s)")
 
-    new_records = collect_new_closed_records(host, token, folder_id, output_dir, limit)
-    if not new_records:
-        print("[+] 0 new closed message(s)")
+    new_records, actionable_records = collect_sync_records(host, token, folder_id, output_dir, limit)
+    if not new_records and not actionable_records:
+        print("[+] 0 new closed message(s), 0 actionable message(s)")
         return
 
-    total = save_new_closed_records(output_dir, new_records, limit)
-    for index, record in enumerate(new_records, start=1):
-        _print_record(index, record)
+    total = len(existing)
+    if new_records:
+        total = save_new_closed_records(output_dir, new_records, limit)
+        for index, record in enumerate(new_records, start=1):
+            _print_record(index, record)
+    else:
+        print("[+] 0 new closed message(s)")
 
-    splunk_rows = update_splunk_from_records(new_records, config)
+    if actionable_records:
+        print(f"[*] {len(actionable_records)} actionable non-Closed message(s)")
+        for index, record in enumerate(actionable_records, start=1):
+            print(
+                f"\n  A{index}. id={record.get('id')} case={record.get('case_number')} "
+                f"status={record.get('case_status')} Actionable={record.get('actionable')}"
+            )
+            print(f"      subject: {record.get('subject')}")
+
+    splunk_rows = update_splunk_from_records(new_records, config) if new_records else 0
+    actionable_rows = (
+        update_splunk_actionable_from_records(actionable_records, config) if actionable_records else 0
+    )
     print(
         f"\n[+] Sync complete: {len(new_records)} new closed message(s), "
-        f"{total} total in {summary_path.resolve()}, {splunk_rows} Splunk lookup row(s) updated"
+        f"{total} total in {summary_path.resolve()}, "
+        f"{splunk_rows} closed Splunk row(s) updated, "
+        f"{actionable_rows} actionable Splunk row(s) updated"
     )
 
 

@@ -82,6 +82,18 @@ def build_splunk_batch_update_search(lookup_name: str, case_updates: dict[str, s
     return "\n".join(lines)
 
 
+def build_splunk_actionable_update_search(lookup_name: str, case_updates: dict[str, str]) -> str:
+    # Actionable only — never touch Status / Remark / Matrix.
+    lines = [f"| inputlookup {_splunk_literal(lookup_name)}"]
+    for ticket, value in case_updates.items():
+        ticket_lit = _splunk_literal(ticket)
+        lines.append(
+            f"| eval Actionable=if(TicketNumber={ticket_lit}, {_splunk_literal(value)}, Actionable)"
+        )
+    lines.append(f"| outputlookup {_splunk_literal(lookup_name)}")
+    return "\n".join(lines)
+
+
 def _splunk_write_lookup_via_spl(session, settings: dict, search: str, label: str) -> None:
     _splunk_run_search(session, settings, search, label, want_results=False)
 
@@ -104,6 +116,29 @@ def _splunk_update_lookup_cases(session, settings: dict, lookup_name: str, case_
     _splunk_write_lookup_via_spl(session, settings, search, f"update {lookup_name}")
     for ticket in sorted(matched):
         print(f"[+] Updated TicketNumber={ticket} in {lookup_name}")
+    return len(matched)
+
+
+def _splunk_update_lookup_actionable(
+    session, settings: dict, lookup_name: str, case_updates: dict[str, str]
+) -> int:
+    rows = _splunk_fetch_lookup_rows(session, settings, lookup_name)
+    if not rows:
+        print(f"[-] Lookup {lookup_name} is empty or not found.")
+        return 0
+
+    existing = {str(row.get("TicketNumber", "")).strip() for row in rows}
+    matched = {ticket for ticket in case_updates if ticket in existing}
+    if not matched:
+        tickets = ", ".join(sorted(case_updates))
+        print(f"[-] No lookup row matched TicketNumber(s) {tickets} in {lookup_name}; skipped")
+        return 0
+
+    updates = {ticket: case_updates[ticket] for ticket in matched}
+    search = build_splunk_actionable_update_search(lookup_name, updates)
+    _splunk_write_lookup_via_spl(session, settings, search, f"update-actionable {lookup_name}")
+    for ticket in sorted(matched):
+        print(f"[+] Set Actionable={updates[ticket]} TicketNumber={ticket} in {lookup_name}")
     return len(matched)
 
 
@@ -287,6 +322,50 @@ def update_splunk_from_records(records: list[dict], config: dict) -> int:
     return total_rows
 
 
+def update_splunk_actionable_from_records(records: list[dict], config: dict) -> int:
+    if not records:
+        return 0
+
+    req = require_requests()
+    settings = _required_splunk_config(config)
+    if not settings["verify_tls"]:
+        req.packages.urllib3.disable_warnings()
+
+    by_lookup: dict[str, dict[str, str]] = {}
+    for index, record in enumerate(records, start=1):
+        case_number = str(record.get("case_number") or "").strip()
+        if not case_number or case_number in {"N/A", "unrelated"}:
+            debug(f"Skip actionable message id={record.get('id')}: no case number")
+            continue
+        flag = str(record.get("actionable") or "").strip()
+        if flag not in {"Yes", "No"}:
+            debug(f"Skip actionable message id={record.get('id')}: invalid actionable={flag!r}")
+            continue
+        try:
+            lookup_name = lookup_name_from_case_number(case_number)
+        except ValueError as e:
+            debug(f"Skip actionable case {case_number}: {e}")
+            continue
+        by_lookup.setdefault(lookup_name, {})[case_number] = flag
+        debug(
+            f"Queued actionable={flag}: {index}/{len(records)} TicketNumber={case_number} "
+            f"lookup={lookup_name} id={record.get('id')}"
+        )
+
+    if not by_lookup:
+        print("[-] No actionable cases with usable case numbers found.")
+        return 0
+
+    debug(f"Connecting to Splunk REST for actionable updates across {len(by_lookup)} lookup(s)")
+    session = req.Session()
+    total_rows = 0
+    for lookup_name, case_updates in by_lookup.items():
+        total_rows += _splunk_update_lookup_actionable(session, settings, lookup_name, case_updates)
+
+    print(f"[+] Done. Actionable lookups={len(by_lookup)} rows updated={total_rows}")
+    return total_rows
+
+
 def update_splunk_from_folder(host: str, email: str, password: str, folder_path: str, limit: int, config: dict) -> None:
     debug("Starting update-splunk")
     debug(f"Mail host={host} folder_path={folder_path} limit={limit}")
@@ -365,4 +444,14 @@ Second line "quoted"
     assert "| outputlookup" in search
     assert "Actionable=if" not in search
     assert 'First line\\nSecond line \\"quoted\\"' in search
+
+    actionable = build_splunk_actionable_update_search(lookup_name, {"1234567890": "Yes"})
+    assert 'Actionable=if(TicketNumber="1234567890", "Yes", Actionable)' in actionable
+    assert "Status=if" not in actionable
+    assert "Remark=if" not in actionable
+    assert "Matrix=if" not in actionable
+    assert "| outputlookup" in actionable
+
+    actionable_no = build_splunk_actionable_update_search(lookup_name, {"1234567890": "No"})
+    assert 'Actionable=if(TicketNumber="1234567890", "No", Actionable)' in actionable_no
     print("[+] Self-test passed")
