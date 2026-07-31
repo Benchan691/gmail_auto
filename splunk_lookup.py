@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import csv
-import io
 import json
 import re
 import time
@@ -61,25 +59,8 @@ def lookup_name_from_case_number(case_number: str) -> str:
     return f"G{digits[:5]}_Ticket_Status.csv"
 
 
-# Forced CSV column order for | table ... | outputlookup writes.
-SPLUNK_LOOKUP_COLUMNS = ("TicketNumber", "Severity", "Status", "Remark", "Matrix", "Actionable")
-
-
 def _splunk_literal(value: str) -> str:
     return json.dumps(str(value), ensure_ascii=False)
-
-
-def _splunk_table_columns() -> str:
-    return ", ".join(SPLUNK_LOOKUP_COLUMNS)
-
-
-def _rows_to_lookup_csv(rows: list[dict], columns: tuple[str, ...] = SPLUNK_LOOKUP_COLUMNS) -> str:
-    buf = io.StringIO()
-    writer = csv.DictWriter(buf, fieldnames=columns, extrasaction="ignore", lineterminator="\n")
-    writer.writeheader()
-    for row in rows:
-        writer.writerow({col: "" if row.get(col) is None else str(row.get(col, "")) for col in columns})
-    return buf.getvalue()
 
 
 def _splunk_fetch_lookup_rows(session, settings: dict, lookup_name: str) -> list[dict]:
@@ -89,49 +70,20 @@ def _splunk_fetch_lookup_rows(session, settings: dict, lookup_name: str) -> list
     return rows
 
 
-def build_splunk_reorder_search(lookup_name: str) -> str:
-    lookup = _splunk_literal(lookup_name)
-    columns = _splunk_table_columns()
-    return "\n".join(
-        [
-            f"| inputlookup {lookup}",
-            f"| table {columns}",
-            f"| outputlookup {lookup}",
-        ]
-    )
-
-
 def build_splunk_batch_update_search(lookup_name: str, case_updates: dict[str, str]) -> str:
+    # Update field values only — no | table; CSV column order stays alphabetical.
     lines = [f"| inputlookup {_splunk_literal(lookup_name)}"]
     for ticket, resolution in case_updates.items():
         ticket_lit = _splunk_literal(ticket)
         lines.append(f"| eval Status=if(TicketNumber={ticket_lit}, {_splunk_literal('Resolved')}, Status)")
         lines.append(f"| eval Remark=if(TicketNumber={ticket_lit}, {_splunk_literal(resolution)}, Remark)")
         lines.append(f"| eval Matrix=if(TicketNumber={ticket_lit}, {_splunk_literal('False Positive')}, Matrix)")
-    lines.append(f"| table {_splunk_table_columns()}")
     lines.append(f"| outputlookup {_splunk_literal(lookup_name)}")
     return "\n".join(lines)
 
 
 def _splunk_write_lookup_via_spl(session, settings: dict, search: str, label: str) -> None:
     _splunk_run_search(session, settings, search, label, want_results=False)
-
-
-def reorder_splunk_lookup(lookup_name: str, config: dict) -> None:
-    req = require_requests()
-    settings = _required_splunk_config(config)
-    if not settings["verify_tls"]:
-        req.packages.urllib3.disable_warnings()
-
-    session = req.Session()
-    rows = _splunk_fetch_lookup_rows(session, settings, lookup_name)
-    if not rows:
-        print(f"[-] Lookup {lookup_name} is empty or not found.")
-        return
-
-    search = build_splunk_reorder_search(lookup_name)
-    _splunk_write_lookup_via_spl(session, settings, search, f"reorder {lookup_name}")
-    print(f"[+] Reordered columns in {lookup_name} to: {', '.join(SPLUNK_LOOKUP_COLUMNS)}")
 
 
 def _splunk_update_lookup_cases(session, settings: dict, lookup_name: str, case_updates: dict[str, str]) -> int:
@@ -409,25 +361,8 @@ Second line "quoted"
     assert 'Status=if(TicketNumber="1234567890", "Resolved", Status)' in search
     assert 'Remark=if(TicketNumber="1234567890",' in search
     assert 'Matrix=if(TicketNumber="1234567890", "False Positive", Matrix)' in search
-    assert "| table TicketNumber, Severity, Status, Remark, Matrix, Actionable" in search
+    assert "| table " not in search
+    assert "| outputlookup" in search
     assert "Actionable=if" not in search
     assert 'First line\\nSecond line \\"quoted\\"' in search
-
-    reorder = build_splunk_reorder_search(lookup_name)
-    assert "| table TicketNumber, Severity, Status, Remark, Matrix, Actionable" in reorder
-    assert "| outputlookup" in reorder
-
-    csv_text = _rows_to_lookup_csv(
-        [
-            {
-                "TicketNumber": "1",
-                "Severity": "High",
-                "Status": "Open",
-                "Remark": "note",
-                "Matrix": "True Positive",
-                "Actionable": "yes",
-            }
-        ]
-    )
-    assert csv_text.splitlines()[0] == "TicketNumber,Severity,Status,Remark,Matrix,Actionable"
     print("[+] Self-test passed")

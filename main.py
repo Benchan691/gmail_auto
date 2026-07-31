@@ -1,7 +1,7 @@
 import argparse
 
 from common import CONFIG_PATH, load_config
-from splunk_lookup import reorder_splunk_lookup, run_self_test, update_splunk_from_folder
+from splunk_lookup import run_self_test, update_splunk_from_folder
 from zimbra import (
     find_cust_g50095,
     list_folder_emails,
@@ -16,9 +16,9 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--method",
-        choices=["soap", "find", "list", "watch", "sync", "update-splunk", "reorder-splunk"],
+        choices=["soap", "find", "list", "watch", "sync", "update-splunk"],
         default="soap",
-        help="SOAP login/test, find, list/watch/sync emails, update/reorder Splunk lookup",
+        help="SOAP login/test, find, list/watch/sync emails, or update Splunk lookup",
     )
     parser.add_argument(
         "--self-test",
@@ -32,8 +32,6 @@ def main():
         type=int,
         help="Max newest messages to examine (any status); Closed among them are kept (overrides config limit)",
     )
-    parser.add_argument("--lookup-name", type=str, help="Splunk lookup CSV filename for --method reorder-splunk")
-
     parser.add_argument("--output", default="output", help="Output directory for --method sync or watch")
 
     args = parser.parse_args()
@@ -81,16 +79,6 @@ def main():
             update_splunk_from_folder(host, email, password, folder_path, limit, config)
         except Exception as e:
             print("[-] Splunk update failed:", e)
-        return
-
-    if args.method == "reorder-splunk":
-        if not args.lookup_name:
-            print("[-] --lookup-name is required for --method reorder-splunk (e.g. G50095_Ticket_Status.csv)")
-            return
-        try:
-            reorder_splunk_lookup(args.lookup_name, config)
-        except Exception as e:
-            print("[-] Splunk reorder failed:", e)
         return
 
     if args.method == "soap":
