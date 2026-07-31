@@ -1,26 +1,9 @@
-import imaplib
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 
 from case_parser import case_fields_for_json, parse_case_fields, plain_text_body
 from common import require_requests
 from email_store import email_ids, emails_path, load_emails, merge_new_emails, save_emails
-
-
-def test_imap_login(host: str, email: str, password: str) -> None:
-    print(f"[*] Connecting to IMAP SSL: {host}:993")
-
-    with imaplib.IMAP4_SSL(host, 993) as mail:
-        mail.login(email, password)
-        print("[+] IMAP login successful")
-
-        status, folders = mail.list()
-        if status == "OK":
-            print("\n[+] Mail folders:")
-            for folder in folders[:20]:
-                print("   ", folder.decode(errors="ignore"))
-
-        mail.logout()
 
 
 def zimbra_soap_login(host: str, email: str, password: str) -> str:
@@ -387,6 +370,10 @@ def is_closed_record(record: dict) -> bool:
     return str(record.get("case_status") or "").lower() == "closed"
 
 
+def _filter_log(message: str) -> None:
+    print(f"[filter] {message}")
+
+
 def scan_closed_folder_records(
     host: str,
     token: str,
@@ -396,41 +383,93 @@ def scan_closed_folder_records(
     known_ids=None,
     stop_at_known: bool = False,
     scan_batch: int = 50,
-    max_scan: int = 500,
 ) -> list[dict]:
+    """Scan newest messages in a folder; keep Closed ones.
+
+    ``limit`` is the max number of messages examined (any status), newest first —
+    not the number of Closed emails to collect.
+    """
     known = known_ids or set()
     closed: list[dict] = []
     seen: set[str] = set()
     offset = 0
     query = f"inid:{folder_id}"
+    examined = 0
+    skipped_open = 0
+    skipped_dup = 0
+    total_limit = max(0, int(limit))
 
-    while offset < max_scan:
-        hits = zimbra_search(host, token, query, limit=scan_batch, offset=offset)
+    _filter_log(
+        f"start folder_id={folder_id} query={query!r} total_message_limit={total_limit} "
+        f"stop_at_known={stop_at_known} known_ids={len(known)} scan_batch={scan_batch}"
+    )
+
+    if total_limit <= 0:
+        _filter_log("done examined=0 kept=0 (limit=0)")
+        return closed
+
+    while examined < total_limit:
+        batch_size = min(scan_batch, total_limit - examined)
+        hits = zimbra_search(host, token, query, limit=batch_size, offset=offset)
         if not hits:
+            _filter_log(f"search offset={offset}: 0 hits — end of folder")
             break
 
+        _filter_log(f"search offset={offset}: {len(hits)} hit(s) (examined={examined}/{total_limit})")
+
         for hit in hits:
-            if stop_at_known and hit["id"] in known:
+            if examined >= total_limit:
+                break
+
+            hit_id = str(hit.get("id", ""))
+            hit_subject = (hit.get("subject") or "(no subject)")[:80]
+            examined += 1
+
+            if stop_at_known and hit_id in known:
+                _filter_log(
+                    f"STOP at known id={hit_id} subject={hit_subject!r} "
+                    f"(examined={examined}/{total_limit} kept={len(closed)} skipped_open={skipped_open})"
+                )
                 return closed
 
             record = message_to_record(host, token, hit)
+            status = record.get("case_status")
+            case_number = record.get("case_number")
+            subject = (record.get("subject") or hit_subject or "")[:80]
+
             if not is_closed_record(record):
+                skipped_open += 1
+                _filter_log(
+                    f"SKIP id={hit_id} case={case_number} status={status!r} "
+                    f"subject={subject!r} reason=not_closed examined={examined}/{total_limit}"
+                )
                 continue
 
             record_id = record.get("id")
             if record_id and record_id in seen:
+                skipped_dup += 1
+                _filter_log(
+                    f"SKIP id={hit_id} case={case_number} status={status!r} "
+                    f"subject={subject!r} reason=duplicate examined={examined}/{total_limit}"
+                )
                 continue
             if record_id:
                 seen.add(str(record_id))
 
             closed.append(record)
-            if not stop_at_known and len(closed) >= limit:
-                return closed
+            _filter_log(
+                f"KEEP id={hit_id} case={case_number} status={status!r} "
+                f"subject={subject!r} kept={len(closed)} examined={examined}/{total_limit}"
+            )
 
         offset += len(hits)
-        if len(hits) < scan_batch:
+        if len(hits) < batch_size:
             break
 
+    _filter_log(
+        f"done examined={examined}/{total_limit} kept={len(closed)} "
+        f"skipped_open={skipped_open} skipped_dup={skipped_dup}"
+    )
     return closed
 
 
@@ -486,12 +525,12 @@ def watch_folder_emails(host: str, email: str, password: str, folder_path: str, 
     summary_path = emails_path(output_dir)
 
     print(f"\n[*] Watching folder path={folder_path} (id={folder_id}, {folder_label})")
-    print(f"    closed limit: {limit}")
+    print(f"    message limit: {limit} (newest total; keep Closed from those)")
     print(f"    output: {summary_path.resolve()}")
 
     existing = load_emails(summary_path)
     if not existing:
-        print("[*] No emails.json yet — fetching up to limit closed message(s)")
+        print("[*] No emails.json yet — scanning up to limit newest message(s)")
 
     new_records = collect_new_closed_records(host, token, folder_id, output_dir, limit)
     if not new_records:
@@ -529,12 +568,12 @@ def sync_folder_emails(
     summary_path = emails_path(output_dir)
 
     print(f"\n[*] Syncing folder path={folder_path} (id={folder_id}, {folder_label})")
-    print(f"    closed limit: {limit}")
+    print(f"    message limit: {limit} (newest total; keep Closed from those)")
     print(f"    output: {summary_path.resolve()}")
 
     existing = load_emails(summary_path)
     if not existing:
-        print("[*] No emails.json yet — fetching up to limit closed message(s)")
+        print("[*] No emails.json yet — scanning up to limit newest message(s)")
 
     new_records = collect_new_closed_records(host, token, folder_id, output_dir, limit)
     if not new_records:

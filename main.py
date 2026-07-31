@@ -6,7 +6,6 @@ from zimbra import (
     find_cust_g50095,
     list_folder_emails,
     sync_folder_emails,
-    test_imap_login,
     watch_folder_emails,
     zimbra_get_info,
     zimbra_soap_login,
@@ -17,9 +16,9 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--method",
-        choices=["imap", "soap", "both", "find", "list", "watch", "sync", "update-splunk", "reorder-splunk"],
-        default="both",
-        help="Login/test, find, list/watch/sync emails, update/reorder Splunk lookup",
+        choices=["soap", "find", "list", "watch", "sync", "update-splunk", "reorder-splunk"],
+        default="soap",
+        help="SOAP login/test, find, list/watch/sync emails, update/reorder Splunk lookup",
     )
     parser.add_argument(
         "--self-test",
@@ -28,7 +27,11 @@ def main():
     )
     parser.add_argument("--config", default=CONFIG_PATH, help="Path to config.json")
     parser.add_argument("--folder-path", type=str, help="Folder path to read emails from (overrides config folder_path)")
-    parser.add_argument("--limit", type=int, help="Number of recent emails to list (overrides config limit)")
+    parser.add_argument(
+        "--limit",
+        type=int,
+        help="Max newest messages to examine (any status); Closed among them are kept (overrides config limit)",
+    )
     parser.add_argument("--lookup-name", type=str, help="Splunk lookup CSV filename for --method reorder-splunk")
 
     parser.add_argument("--output", default="output", help="Output directory for --method sync or watch")
@@ -44,12 +47,6 @@ def main():
     password = config["password"]
     folder_path = str(args.folder_path if args.folder_path is not None else config.get("folder_path", "Inbox"))
     limit = args.limit if args.limit is not None else int(config.get("limit", 10))
-
-    if args.method in ["imap", "both"]:
-        try:
-            test_imap_login(host, email, password)
-        except Exception as e:
-            print("[-] IMAP login failed:", e)
 
     if args.method == "find":
         try:
@@ -96,7 +93,7 @@ def main():
             print("[-] Splunk reorder failed:", e)
         return
 
-    if args.method in ["soap", "both"]:
+    if args.method == "soap":
         try:
             token = zimbra_soap_login(host, email, password)
             zimbra_get_info(host, token)

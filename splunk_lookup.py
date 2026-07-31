@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import io
 import json
+import re
 import time
 from urllib.parse import quote, urlparse, urlunparse
 
@@ -60,6 +61,7 @@ def lookup_name_from_case_number(case_number: str) -> str:
     return f"G{digits[:5]}_Ticket_Status.csv"
 
 
+# Forced CSV column order for | table ... | outputlookup writes.
 SPLUNK_LOOKUP_COLUMNS = ("TicketNumber", "Severity", "Status", "Remark", "Matrix", "Actionable")
 
 
@@ -233,10 +235,21 @@ def _splunk_run_search(session, settings: dict, search: str, label: str, want_re
     return results
 
 
+def sanitize_resolution_for_splunk(resolution: str) -> str:
+    """Remove 'False positive' from resolution text before writing Remark in Splunk."""
+    text = re.sub(r"(?i)\bfalse\s+positive\b", "", str(resolution or ""))
+    lines: list[str] = []
+    for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        cleaned = re.sub(r"[ \t]{2,}", " ", line).strip(" \t,;:-–—")
+        if cleaned:
+            lines.append(cleaned)
+    return "\n".join(lines).strip()
+
+
 def case_update_from_fields(case_fields: dict) -> tuple[dict | None, str]:
     case_number = str(case_fields.get("case_number") or "").strip()
     case_status = str(case_fields.get("case_status") or "").strip()
-    resolution = str(case_fields.get("resolution") or "").strip()
+    resolution = sanitize_resolution_for_splunk(str(case_fields.get("resolution") or "").strip())
 
     if not case_number or case_number in {"N/A", "unrelated"}:
         return None, "no case number"
@@ -367,6 +380,25 @@ Second line "quoted"
     )
     assert non_closed is None
     assert "not Closed" in reason
+
+    cleaned, reason = case_update_from_fields(
+        {
+            "case_number": "1234567890",
+            "case_status": "Closed",
+            "resolution": "False positive - confirmed by SOC review",
+        }
+    )
+    assert reason == "queued"
+    assert cleaned == {
+        "case_number": "1234567890",
+        "resolution": "confirmed by SOC review",
+    }
+
+    only_fp, reason = case_update_from_fields(
+        {"case_number": "1234567890", "case_status": "Closed", "resolution": "False Positive"}
+    )
+    assert only_fp is None
+    assert "no resolution" in reason
 
     assert lookup_name_from_case_number("500952026070510025940") == "G50095_Ticket_Status.csv"
     lookup_name = lookup_name_from_case_number(update["case_number"])

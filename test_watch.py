@@ -39,7 +39,8 @@ class TestScanClosedFolderRecords(unittest.TestCase):
         status = "Closed" if "closed" in hit["id"] else "Open"
         return {"id": hit["id"], "case_status": status}
 
-    def test_collects_only_closed_up_to_limit(self):
+    def test_keeps_closed_within_total_message_limit(self):
+        # limit=4 examines open1, closed1, open2, closed2 — keeps 2 closed (not closed3)
         hits = [
             {"id": "open1"},
             {"id": "closed1"},
@@ -55,7 +56,7 @@ class TestScanClosedFolderRecords(unittest.TestCase):
 
         with patch.object(zimbra_module, "zimbra_search", side_effect=search):
             with patch.object(zimbra_module, "message_to_record", side_effect=lambda h, t, hit: self._fake_record(hit)):
-                result = scan_closed_folder_records("h", "t", "373", 2, scan_batch=10, max_scan=10)
+                result = scan_closed_folder_records("h", "t", "373", 4, scan_batch=10)
 
         self.assertEqual([r["id"] for r in result], ["closed1", "closed2"])
 
@@ -63,7 +64,7 @@ class TestScanClosedFolderRecords(unittest.TestCase):
         hits = [{"id": "closed-new"}, {"id": "closed-known"}, {"id": "closed-old"}]
 
         def search(host, token, query, limit=50, offset=0):
-            return hits
+            return hits[offset : offset + limit]
 
         import zimbra as zimbra_module
 
@@ -77,12 +78,11 @@ class TestScanClosedFolderRecords(unittest.TestCase):
                     known_ids={"closed-known"},
                     stop_at_known=True,
                     scan_batch=10,
-                    max_scan=10,
                 )
 
         self.assertEqual([r["id"] for r in result], ["closed-new"])
 
-    def test_paginates_until_limit(self):
+    def test_paginates_until_total_message_limit(self):
         batch1 = [{"id": f"open{i}"} for i in range(3)]
         batch2 = [{"id": "closed1"}, {"id": "closed2"}]
         calls = {"n": 0}
@@ -90,16 +90,17 @@ class TestScanClosedFolderRecords(unittest.TestCase):
         def search(host, token, query, limit=50, offset=0):
             calls["n"] += 1
             if offset == 0:
-                return batch1
+                return batch1[:limit]
             if offset == 3:
-                return batch2
+                return batch2[:limit]
             return []
 
         import zimbra as zimbra_module
 
         with patch.object(zimbra_module, "zimbra_search", side_effect=search):
             with patch.object(zimbra_module, "message_to_record", side_effect=lambda h, t, hit: self._fake_record(hit)):
-                result = scan_closed_folder_records("h", "t", "373", 2, scan_batch=3, max_scan=10)
+                # total 5 messages: 3 open + closed1 + closed2
+                result = scan_closed_folder_records("h", "t", "373", 5, scan_batch=3)
 
         self.assertEqual(calls["n"], 2)
         self.assertEqual([r["id"] for r in result], ["closed1", "closed2"])
