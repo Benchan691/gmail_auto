@@ -51,7 +51,7 @@ class TestActionableMatchers(unittest.TestCase):
                 "Re: TrustCSI Security Incident Notification (Case Number: 50095)"
             )
         )
-        self.assertTrue(
+        self.assertFalse(
             is_trustcsi_reply_subject(
                 "Re: Re: TrustCSI Security Incident Notification (Case Number: 50095)"
             )

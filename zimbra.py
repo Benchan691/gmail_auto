@@ -388,10 +388,13 @@ def is_closed_record(record: dict) -> bool:
 
 
 def is_trustcsi_reply_subject(subject: str) -> bool:
-    text = subject or ""
-    if not re.search(r"(?i)\bre:", text):
-        return False
-    return bool(re.search(r"(?i)TrustCSI Security Incident Notification", text))
+    # Exactly one leading Re: — reject "Re: Re: TrustCSI ..."
+    return bool(
+        re.search(
+            r"(?i)^\s*Re:\s*TrustCSI Security Incident Notification",
+            subject or "",
+        )
+    )
 
 
 def has_it_support_recipient(to_list) -> bool:
