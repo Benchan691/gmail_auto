@@ -23,6 +23,16 @@ def email_ids(records: list[dict]) -> set[str]:
     return {str(record["id"]) for record in records if record.get("id")}
 
 
+def email_case_numbers(records: list[dict]) -> set[str]:
+    """Case numbers from saved closed emails (for closed_mode=skip)."""
+    cases: set[str] = set()
+    for record in records:
+        case = str(record.get("case_number") or "").strip()
+        if case and case not in {"N/A", "unrelated"}:
+            cases.add(case)
+    return cases
+
+
 def merge_new_emails(existing: list[dict], new_records: list[dict], limit: int) -> list[dict]:
     merged: list[dict] = []
     seen: set[str] = set()

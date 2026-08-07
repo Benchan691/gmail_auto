@@ -59,8 +59,50 @@ def lookup_name_from_case_number(case_number: str) -> str:
     return f"G{digits[:5]}_Ticket_Status.csv"
 
 
+LOOKUP_CSV_COLUMNS = ("TicketNumber", "Severity", "Status", "Remark", "Matrix", "Actionable")
+UPDATE_MODES = frozenset({"overwrite", "skip"})
+
+
 def _splunk_literal(value: str) -> str:
     return json.dumps(str(value), ensure_ascii=False)
+
+
+def _lookup_table_clause() -> str:
+    return f"| table {', '.join(LOOKUP_CSV_COLUMNS)}"
+
+
+def update_mode_from_config(config: dict, key: str, default: str = "overwrite") -> str:
+    """Return 'overwrite' or 'skip' for closed_mode / actionable_mode."""
+    raw = config.get(key, default)
+    mode = str(raw if raw is not None else default).strip().lower()
+    if mode not in UPDATE_MODES:
+        raise ValueError(f"{key} must be 'overwrite' or 'skip', got {raw!r}")
+    return mode
+
+
+def actionable_already_set(row: dict) -> bool:
+    return bool(str(row.get("Actionable") or "").strip())
+
+
+def select_tickets_for_update(
+    case_updates: dict[str, str],
+    rows: list[dict],
+    mode: str,
+    already_set,
+) -> tuple[dict[str, str], list[str]]:
+    """Return (tickets to write, tickets skipped because already set in skip mode)."""
+    by_ticket = {str(row.get("TicketNumber", "")).strip(): row for row in rows}
+    selected: dict[str, str] = {}
+    skipped: list[str] = []
+    for ticket, value in case_updates.items():
+        row = by_ticket.get(ticket)
+        if row is None:
+            continue
+        if mode == "skip" and already_set(row):
+            skipped.append(ticket)
+            continue
+        selected[ticket] = value
+    return selected, skipped
 
 
 def _splunk_fetch_lookup_rows(session, settings: dict, lookup_name: str) -> list[dict]:
@@ -70,14 +112,17 @@ def _splunk_fetch_lookup_rows(session, settings: dict, lookup_name: str) -> list
     return rows
 
 
-def build_splunk_batch_update_search(lookup_name: str, case_updates: dict[str, str]) -> str:
-    # Update field values only — no | table; CSV column order stays alphabetical.
+def build_splunk_batch_update_search(lookup_name: str, case_updates: dict[str, dict[str, str]]) -> str:
+    # Update field values, then pin CSV column order before outputlookup.
     lines = [f"| inputlookup {_splunk_literal(lookup_name)}"]
-    for ticket, resolution in case_updates.items():
+    for ticket, payload in case_updates.items():
+        resolution = payload.get("resolution", "")
+        matrix_value = payload.get("matrix") or matrix_from_resolution(resolution)
         ticket_lit = _splunk_literal(ticket)
         lines.append(f"| eval Status=if(TicketNumber={ticket_lit}, {_splunk_literal('Resolved')}, Status)")
         lines.append(f"| eval Remark=if(TicketNumber={ticket_lit}, {_splunk_literal(resolution)}, Remark)")
-        lines.append(f"| eval Matrix=if(TicketNumber={ticket_lit}, {_splunk_literal('False Positive')}, Matrix)")
+        lines.append(f"| eval Matrix=if(TicketNumber={ticket_lit}, {_splunk_literal(matrix_value)}, Matrix)")
+    lines.append(_lookup_table_clause())
     lines.append(f"| outputlookup {_splunk_literal(lookup_name)}")
     return "\n".join(lines)
 
@@ -90,6 +135,7 @@ def build_splunk_actionable_update_search(lookup_name: str, case_updates: dict[s
         lines.append(
             f"| eval Actionable=if(TicketNumber={ticket_lit}, {_splunk_literal(value)}, Actionable)"
         )
+    lines.append(_lookup_table_clause())
     lines.append(f"| outputlookup {_splunk_literal(lookup_name)}")
     return "\n".join(lines)
 
@@ -98,7 +144,9 @@ def _splunk_write_lookup_via_spl(session, settings: dict, search: str, label: st
     _splunk_run_search(session, settings, search, label, want_results=False)
 
 
-def _splunk_update_lookup_cases(session, settings: dict, lookup_name: str, case_updates: dict[str, str]) -> int:
+def _splunk_update_lookup_cases(
+    session, settings: dict, lookup_name: str, case_updates: dict[str, dict[str, str]]
+) -> int:
     rows = _splunk_fetch_lookup_rows(session, settings, lookup_name)
     if not rows:
         print(f"[-] Lookup {lookup_name} is empty or not found.")
@@ -114,13 +162,17 @@ def _splunk_update_lookup_cases(session, settings: dict, lookup_name: str, case_
     updates = {ticket: case_updates[ticket] for ticket in matched}
     search = build_splunk_batch_update_search(lookup_name, updates)
     _splunk_write_lookup_via_spl(session, settings, search, f"update {lookup_name}")
-    for ticket in sorted(matched):
+    for ticket in sorted(updates):
         print(f"[+] Updated TicketNumber={ticket} in {lookup_name}")
-    return len(matched)
+    return len(updates)
 
 
 def _splunk_update_lookup_actionable(
-    session, settings: dict, lookup_name: str, case_updates: dict[str, str]
+    session,
+    settings: dict,
+    lookup_name: str,
+    case_updates: dict[str, str],
+    mode: str = "overwrite",
 ) -> int:
     rows = _splunk_fetch_lookup_rows(session, settings, lookup_name)
     if not rows:
@@ -134,12 +186,23 @@ def _splunk_update_lookup_actionable(
         print(f"[-] No lookup row matched TicketNumber(s) {tickets} in {lookup_name}; skipped")
         return 0
 
-    updates = {ticket: case_updates[ticket] for ticket in matched}
+    matched_updates = {ticket: case_updates[ticket] for ticket in matched}
+    updates, skipped = select_tickets_for_update(
+        matched_updates, rows, mode, actionable_already_set
+    )
+    for ticket in sorted(skipped):
+        print(
+            f"[=] Skip actionable TicketNumber={ticket} in {lookup_name} "
+            f"(already set, actionable_mode=skip)"
+        )
+    if not updates:
+        return 0
+
     search = build_splunk_actionable_update_search(lookup_name, updates)
     _splunk_write_lookup_via_spl(session, settings, search, f"update-actionable {lookup_name}")
-    for ticket in sorted(matched):
+    for ticket in sorted(updates):
         print(f"[+] Set Actionable={updates[ticket]} TicketNumber={ticket} in {lookup_name}")
-    return len(matched)
+    return len(updates)
 
 
 def _splunk_jobs_path(owner: str, app: str) -> str:
@@ -222,12 +285,23 @@ def _splunk_run_search(session, settings: dict, search: str, label: str, want_re
     return results
 
 
+def matrix_from_resolution(resolution: str) -> str:
+    """Matrix defaults to False Positive; use True Positive only when the resolution says so."""
+    text = str(resolution or "")
+    if re.search(r"(?i)\btrue\s+positive\b", text):
+        return "True Positive"
+    return "False Positive"
+
+
 def sanitize_resolution_for_splunk(resolution: str) -> str:
-    """Remove 'False positive' from resolution text before writing Remark in Splunk."""
-    text = re.sub(r"(?i)\bfalse\s+positive\b", "", str(resolution or ""))
+    """Remove True/False positive labels from resolution text before writing Remark."""
+    text = re.sub(r"(?i)\b(?:true|false)\s+positive\b", "", str(resolution or ""))
     lines: list[str] = []
     for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
         cleaned = re.sub(r"[ \t]{2,}", " ", line).strip(" \t,;:-–—")
+        # "sentence. False positive." → "sentence. ." → collapse to one full stop
+        cleaned = re.sub(r"\.(?:\s*\.)+", ".", cleaned)
+        cleaned = re.sub(r"[ \t]{2,}", " ", cleaned).strip(" \t,;:-–—")
         if cleaned:
             lines.append(cleaned)
     return "\n".join(lines).strip()
@@ -236,7 +310,9 @@ def sanitize_resolution_for_splunk(resolution: str) -> str:
 def case_update_from_fields(case_fields: dict) -> tuple[dict | None, str]:
     case_number = str(case_fields.get("case_number") or "").strip()
     case_status = str(case_fields.get("case_status") or "").strip()
-    resolution = sanitize_resolution_for_splunk(str(case_fields.get("resolution") or "").strip())
+    raw_resolution = str(case_fields.get("resolution") or "").strip()
+    matrix = matrix_from_resolution(raw_resolution)
+    resolution = sanitize_resolution_for_splunk(raw_resolution)
 
     if not case_number or case_number in {"N/A", "unrelated"}:
         return None, "no case number"
@@ -245,11 +321,21 @@ def case_update_from_fields(case_fields: dict) -> tuple[dict | None, str]:
     if not resolution or resolution in {"N/A", "unrelated"}:
         return None, "closed case has no resolution"
 
-    return {"case_number": case_number, "resolution": resolution}, "queued"
+    return {"case_number": case_number, "resolution": resolution, "matrix": matrix}, "queued"
 
 
-def build_splunk_update_search(lookup_name: str, case_number: str, resolution: str) -> str:
-    return build_splunk_batch_update_search(lookup_name, {case_number: resolution})
+def build_splunk_update_search(
+    lookup_name: str, case_number: str, resolution: str, matrix: str | None = None
+) -> str:
+    return build_splunk_batch_update_search(
+        lookup_name,
+        {
+            case_number: {
+                "resolution": resolution,
+                "matrix": matrix or matrix_from_resolution(resolution),
+            }
+        },
+    )
 
 
 def _splunk_update_case(session, settings: dict, update: dict) -> int:
@@ -260,7 +346,17 @@ def _splunk_update_case(session, settings: dict, update: dict) -> int:
         print(f"[-] Skip TicketNumber={case_number}: {e}")
         return 0
 
-    return _splunk_update_lookup_cases(session, settings, lookup_name, {case_number: update["resolution"]})
+    return _splunk_update_lookup_cases(
+        session,
+        settings,
+        lookup_name,
+        {
+            case_number: {
+                "resolution": update["resolution"],
+                "matrix": update.get("matrix") or matrix_from_resolution(update["resolution"]),
+            }
+        },
+    )
 
 
 def update_splunk_from_records(records: list[dict], config: dict) -> int:
@@ -300,7 +396,7 @@ def update_splunk_from_records(records: list[dict], config: dict) -> int:
         updates[update["case_number"]] = update
         debug(
             f"Queued update: TicketNumber={update['case_number']} lookup={lookup_name} "
-            f"Remark chars={len(update['resolution'])}"
+            f"Remark chars={len(update['resolution'])} Matrix={update['matrix']}"
         )
 
     if not updates:
@@ -309,10 +405,13 @@ def update_splunk_from_records(records: list[dict], config: dict) -> int:
 
     debug(f"Connecting to Splunk REST for {len(updates)} queued case update(s)")
     session = req.Session()
-    by_lookup: dict[str, dict[str, str]] = {}
+    by_lookup: dict[str, dict[str, dict[str, str]]] = {}
     for update in updates.values():
         lookup_name = lookup_name_from_case_number(update["case_number"])
-        by_lookup.setdefault(lookup_name, {})[update["case_number"]] = update["resolution"]
+        by_lookup.setdefault(lookup_name, {})[update["case_number"]] = {
+            "resolution": update["resolution"],
+            "matrix": update["matrix"],
+        }
 
     total_rows = 0
     for lookup_name, case_updates in by_lookup.items():
@@ -326,6 +425,7 @@ def update_splunk_actionable_from_records(records: list[dict], config: dict) -> 
     if not records:
         return 0
 
+    mode = update_mode_from_config(config, "actionable_mode")
     req = require_requests()
     settings = _required_splunk_config(config)
     if not settings["verify_tls"]:
@@ -356,11 +456,16 @@ def update_splunk_actionable_from_records(records: list[dict], config: dict) -> 
         print("[-] No actionable cases with usable case numbers found.")
         return 0
 
-    debug(f"Connecting to Splunk REST for actionable updates across {len(by_lookup)} lookup(s)")
+    debug(
+        f"Connecting to Splunk REST for actionable updates across {len(by_lookup)} lookup(s) "
+        f"(actionable_mode={mode})"
+    )
     session = req.Session()
     total_rows = 0
     for lookup_name, case_updates in by_lookup.items():
-        total_rows += _splunk_update_lookup_actionable(session, settings, lookup_name, case_updates)
+        total_rows += _splunk_update_lookup_actionable(
+            session, settings, lookup_name, case_updates, mode=mode
+        )
 
     print(f"[+] Done. Actionable lookups={len(by_lookup)} rows updated={total_rows}")
     return total_rows
@@ -404,6 +509,7 @@ Second line "quoted"
     assert update == {
         "case_number": "1234567890",
         "resolution": 'First line\nSecond line "quoted"',
+        "matrix": "False Positive",
     }
 
     non_closed, reason = case_update_from_fields(
@@ -423,7 +529,56 @@ Second line "quoted"
     assert cleaned == {
         "case_number": "1234567890",
         "resolution": "confirmed by SOC review",
+        "matrix": "False Positive",
     }
+
+    doubled, reason = case_update_from_fields(
+        {
+            "case_number": "1234567890",
+            "case_status": "Closed",
+            "resolution": "No other security events correlate. False positive.",
+        }
+    )
+    assert reason == "queued"
+    assert doubled == {
+        "case_number": "1234567890",
+        "resolution": "No other security events correlate.",
+        "matrix": "False Positive",
+    }
+
+    true_pos, reason = case_update_from_fields(
+        {
+            "case_number": "500952026080101033901",
+            "case_status": "Closed",
+            "resolution": (
+                "Network scanning attempt on Alibaba load balancer and Infra team "
+                "has been informed with firewall rules set. True Positive."
+            ),
+        }
+    )
+    assert reason == "queued"
+    assert true_pos == {
+        "case_number": "500952026080101033901",
+        "resolution": (
+            "Network scanning attempt on Alibaba load balancer and Infra team "
+            "has been informed with firewall rules set."
+        ),
+        "matrix": "True Positive",
+    }
+    tp_search = build_splunk_update_search(
+        "G50095_Ticket_Status.csv",
+        true_pos["case_number"],
+        true_pos["resolution"],
+        true_pos["matrix"],
+    )
+    assert 'Matrix=if(TicketNumber="500952026080101033901", "True Positive", Matrix)' in tp_search
+    assert "True Positive." not in tp_search or 'Matrix=if' in tp_search
+    assert 'Remark=if(TicketNumber="500952026080101033901"' in tp_search
+    assert "firewall rules set." in tp_search
+    assert re.search(
+        r'Remark=if\(TicketNumber="500952026080101033901", "[^"]*True Positive',
+        tp_search,
+    ) is None
 
     only_fp, reason = case_update_from_fields(
         {"case_number": "1234567890", "case_status": "Closed", "resolution": "False Positive"}
@@ -431,17 +586,26 @@ Second line "quoted"
     assert only_fp is None
     assert "no resolution" in reason
 
+    only_tp, reason = case_update_from_fields(
+        {"case_number": "1234567890", "case_status": "Closed", "resolution": "True Positive"}
+    )
+    assert only_tp is None
+    assert "no resolution" in reason
+
     assert lookup_name_from_case_number("500952026070510025940") == "G50095_Ticket_Status.csv"
     lookup_name = lookup_name_from_case_number(update["case_number"])
     assert lookup_name == "G12345_Ticket_Status.csv"
 
-    search = build_splunk_update_search(lookup_name, update["case_number"], update["resolution"])
+    expected_table = "| table TicketNumber, Severity, Status, Remark, Matrix, Actionable"
+    search = build_splunk_update_search(
+        lookup_name, update["case_number"], update["resolution"], update["matrix"]
+    )
     assert 'inputlookup "G12345_Ticket_Status.csv"' in search
     assert 'Status=if(TicketNumber="1234567890", "Resolved", Status)' in search
     assert 'Remark=if(TicketNumber="1234567890",' in search
     assert 'Matrix=if(TicketNumber="1234567890", "False Positive", Matrix)' in search
-    assert "| table " not in search
-    assert "| outputlookup" in search
+    assert expected_table in search
+    assert search.index(expected_table) < search.index("| outputlookup")
     assert "Actionable=if" not in search
     assert 'First line\\nSecond line \\"quoted\\"' in search
 
@@ -450,8 +614,27 @@ Second line "quoted"
     assert "Status=if" not in actionable
     assert "Remark=if" not in actionable
     assert "Matrix=if" not in actionable
-    assert "| outputlookup" in actionable
+    assert expected_table in actionable
+    assert actionable.index(expected_table) < actionable.index("| outputlookup")
 
     actionable_no = build_splunk_actionable_update_search(lookup_name, {"1234567890": "No"})
     assert 'Actionable=if(TicketNumber="1234567890", "No", Actionable)' in actionable_no
+
+    assert update_mode_from_config({}, "closed_mode") == "overwrite"
+    assert update_mode_from_config({"closed_mode": "SKIP"}, "closed_mode") == "skip"
+    assert update_mode_from_config({"actionable_mode": "overwrite"}, "actionable_mode") == "overwrite"
+    try:
+        update_mode_from_config({"closed_mode": "force"}, "closed_mode")
+        assert False, "expected ValueError for invalid mode"
+    except ValueError:
+        pass
+
+    rows = [
+        {"TicketNumber": "1", "Actionable": ""},
+        {"TicketNumber": "2", "Actionable": "Yes"},
+    ]
+    selected, skipped = select_tickets_for_update(
+        {"1": "Yes", "2": "No"}, rows, "skip", actionable_already_set
+    )
+    assert selected == {"1": "Yes"} and skipped == ["2"]
     print("[+] Self-test passed")

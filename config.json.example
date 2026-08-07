@@ -3,6 +3,8 @@
   "folder_path": "Inbox",
   "limit": 10,
   "stop_at_known": true,
+  "closed_mode": "overwrite",
+  "actionable_mode": "overwrite",
   "splunk_web_url": "https://172.16.32.8:8000",
   "splunk_rest_url": "",
   "splunk_app": "search",

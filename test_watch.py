@@ -138,7 +138,7 @@ class TestScanClosedFolderRecords(unittest.TestCase):
         return record
 
     def test_keeps_closed_within_total_message_limit(self):
-        # limit=4 examines open1, closed1, open2, closed2 — keeps 2 closed (not closed3)
+        # Same case number → only newest closed kept; closed2 is duplicate.
         hits = [
             {"id": "open1"},
             {"id": "closed1"},
@@ -155,6 +155,32 @@ class TestScanClosedFolderRecords(unittest.TestCase):
         with patch.object(zimbra_module, "zimbra_search", side_effect=search):
             with patch.object(zimbra_module, "message_to_record", side_effect=lambda h, t, hit: self._fake_record(hit)):
                 result = scan_closed_folder_records("h", "t", "373", 4, scan_batch=10)
+
+        self.assertEqual([r["id"] for r in result], ["closed1"])
+
+    def test_keeps_distinct_closed_cases(self):
+        hits = [
+            {"id": "closed1", "case_number": "500952026070510025941"},
+            {"id": "closed2", "case_number": "500952026070510025942"},
+        ]
+
+        def search(host, token, query, limit=50, offset=0):
+            return hits[offset : offset + limit]
+
+        def record(h, t, hit):
+            return {
+                "id": hit["id"],
+                "case_status": "Closed",
+                "case_number": hit["case_number"],
+                "subject": "Other",
+                "to": [],
+            }
+
+        import zimbra as zimbra_module
+
+        with patch.object(zimbra_module, "zimbra_search", side_effect=search):
+            with patch.object(zimbra_module, "message_to_record", side_effect=record):
+                result = scan_closed_folder_records("h", "t", "373", 10, scan_batch=10)
 
         self.assertEqual([r["id"] for r in result], ["closed1", "closed2"])
 
@@ -204,6 +230,7 @@ class TestScanClosedFolderRecords(unittest.TestCase):
         self.assertEqual([r["id"] for r in result], ["closed-new"])
 
     def test_continues_past_known_when_stop_disabled(self):
+        # Message-id "known" is not used for closed skip; case still kept once.
         hits = [
             {"id": "open-yes", "actionable": "Yes", "case_number": "500952026070510025941"},
             {"id": "closed-known"},
@@ -224,18 +251,57 @@ class TestScanClosedFolderRecords(unittest.TestCase):
                     10,
                     known_ids={"closed-known"},
                     stop_at_known=False,
+                    closed_mode="overwrite",
                     scan_batch=10,
                 )
 
-        self.assertEqual(closed, [])
+        self.assertEqual([r["id"] for r in closed], ["closed-known"])
         self.assertEqual(
             [(r["id"], r["actionable"]) for r in actionable],
             [("open-yes", "Yes"), ("open-no", "No")],
         )
 
+    def test_closed_mode_skip_skips_known_cases_not_message_ids(self):
+        hits = [
+            {"id": "closed-new-msg"},
+            {"id": "closed-other", "case_number": "500952026070510025999"},
+        ]
+
+        def search(host, token, query, limit=50, offset=0):
+            return hits[offset : offset + limit]
+
+        def record(h, t, hit):
+            return {
+                "id": hit["id"],
+                "case_status": "Closed",
+                "case_number": hit.get("case_number", "500952026070510025940"),
+                "subject": "Other",
+                "to": [],
+            }
+
+        import zimbra as zimbra_module
+
+        with patch.object(zimbra_module, "zimbra_search", side_effect=search):
+            with patch.object(zimbra_module, "message_to_record", side_effect=record):
+                closed, _ = scan_folder_records(
+                    "h",
+                    "t",
+                    "373",
+                    10,
+                    known_ids=set(),
+                    closed_mode="skip",
+                    known_closed_cases={"500952026070510025940"},
+                    scan_batch=10,
+                )
+
+        self.assertEqual([r["id"] for r in closed], ["closed-other"])
+
     def test_paginates_until_total_message_limit(self):
         batch1 = [{"id": f"open{i}"} for i in range(3)]
-        batch2 = [{"id": "closed1"}, {"id": "closed2"}]
+        batch2 = [
+            {"id": "closed1", "case_number": "500952026070510025941"},
+            {"id": "closed2", "case_number": "500952026070510025942"},
+        ]
         calls = {"n": 0}
 
         def search(host, token, query, limit=50, offset=0):
@@ -246,10 +312,21 @@ class TestScanClosedFolderRecords(unittest.TestCase):
                 return batch2[:limit]
             return []
 
+        def record(h, t, hit):
+            if "closed" in hit["id"]:
+                return {
+                    "id": hit["id"],
+                    "case_status": "Closed",
+                    "case_number": hit["case_number"],
+                    "subject": "Other",
+                    "to": [],
+                }
+            return self._fake_record(hit)
+
         import zimbra as zimbra_module
 
         with patch.object(zimbra_module, "zimbra_search", side_effect=search):
-            with patch.object(zimbra_module, "message_to_record", side_effect=lambda h, t, hit: self._fake_record(hit)):
+            with patch.object(zimbra_module, "message_to_record", side_effect=record):
                 # total 5 messages: 3 open + closed1 + closed2
                 result = scan_closed_folder_records("h", "t", "373", 5, scan_batch=3)
 
@@ -301,7 +378,13 @@ class TestSyncFolderEmails(unittest.TestCase):
         sync_folder_emails("host", "user@example.com", "pass", "373", 10, "output", {})
 
         mock_collect.assert_called_once_with(
-            "host", "token", "373", "output", 10, stop_at_known=True
+            "host",
+            "token",
+            "373",
+            "output",
+            10,
+            stop_at_known=True,
+            closed_mode="overwrite",
         )
         mock_save.assert_called_once_with("output", new_records, 10)
         mock_splunk.assert_called_once_with(new_records, {})

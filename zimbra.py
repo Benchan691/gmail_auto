@@ -5,7 +5,14 @@ from typing import Optional
 
 from case_parser import case_fields_for_json, parse_case_fields, plain_text_body
 from common import require_requests
-from email_store import email_ids, emails_path, load_emails, merge_new_emails, save_emails
+from email_store import (
+    email_case_numbers,
+    email_ids,
+    emails_path,
+    load_emails,
+    merge_new_emails,
+    save_emails,
+)
 
 IT_SUPPORT_EMAIL = "it.support@kaitaksportspark.com.hk"
 
@@ -433,6 +440,15 @@ def _filter_log(message: str) -> None:
     print(f"[filter] {message}")
 
 
+def _closed_dedupe_key(case_number, record_id) -> str:
+    case_key = str(case_number or "").strip()
+    if case_key and case_key not in {"N/A", "unrelated"}:
+        return case_key
+    if record_id:
+        return f"id:{record_id}"
+    return ""
+
+
 def scan_folder_records(
     host: str,
     token: str,
@@ -441,18 +457,25 @@ def scan_folder_records(
     *,
     known_ids=None,
     stop_at_known: bool = False,
+    closed_mode: str = "overwrite",
+    known_closed_cases=None,
     scan_batch: int = 50,
 ) -> tuple[list[dict], list[dict]]:
     """Scan newest messages; return (closed, actionable) from the same pass.
 
     ``limit`` is the max number of messages examined (any status), newest first.
+    Closed messages are deduped by case number (newest first). With
+    ``closed_mode=skip``, cases already in ``known_closed_cases`` are skipped.
+    Message id new/old is not used for closed keep/skip (only ``stop_at_known``).
     Actionable updates = non-Closed TrustCSI replies with a usable case number
     (Yes if To includes IT Support, otherwise No).
     """
     known = known_ids or set()
+    known_cases = known_closed_cases or set()
+    mode = str(closed_mode or "overwrite").strip().lower()
     closed: list[dict] = []
     actionable: list[dict] = []
-    seen_closed: set[str] = set()
+    seen_closed_cases: set[str] = set()
     seen_actionable_cases: set[str] = set()
     offset = 0
     query = f"inid:{folder_id}"
@@ -463,7 +486,8 @@ def scan_folder_records(
 
     _filter_log(
         f"start folder_id={folder_id} query={query!r} total_message_limit={total_limit} "
-        f"stop_at_known={stop_at_known} known_ids={len(known)} scan_batch={scan_batch}"
+        f"stop_at_known={stop_at_known} known_ids={len(known)} closed_mode={mode} "
+        f"known_closed_cases={len(known_cases)} scan_batch={scan_batch}"
     )
 
     if total_limit <= 0:
@@ -528,23 +552,24 @@ def scan_folder_records(
                     )
                 continue
 
-            record_id = record.get("id")
-            if record_id and str(record_id) in known:
+            case_key = str(case_number or "").strip()
+            dedupe_key = _closed_dedupe_key(case_number, record.get("id") or hit_id)
+            if mode == "skip" and case_key and case_key in known_cases:
                 skipped_dup += 1
                 _filter_log(
                     f"SKIP id={hit_id} case={case_number} status={status!r} "
-                    f"subject={subject!r} reason=known_closed examined={examined}/{total_limit}"
+                    f"subject={subject!r} reason=closed_duplicate examined={examined}/{total_limit}"
                 )
                 continue
-            if record_id and record_id in seen_closed:
+            if dedupe_key and dedupe_key in seen_closed_cases:
                 skipped_dup += 1
                 _filter_log(
                     f"SKIP id={hit_id} case={case_number} status={status!r} "
-                    f"subject={subject!r} reason=duplicate examined={examined}/{total_limit}"
+                    f"subject={subject!r} reason=closed_duplicate examined={examined}/{total_limit}"
                 )
                 continue
-            if record_id:
-                seen_closed.add(str(record_id))
+            if dedupe_key:
+                seen_closed_cases.add(dedupe_key)
 
             closed.append(record)
             _filter_log(
@@ -571,6 +596,8 @@ def scan_closed_folder_records(
     *,
     known_ids=None,
     stop_at_known: bool = False,
+    closed_mode: str = "overwrite",
+    known_closed_cases=None,
     scan_batch: int = 50,
 ) -> list[dict]:
     """Scan newest messages in a folder; keep Closed ones."""
@@ -581,6 +608,8 @@ def scan_closed_folder_records(
         limit,
         known_ids=known_ids,
         stop_at_known=stop_at_known,
+        closed_mode=closed_mode,
+        known_closed_cases=known_closed_cases,
         scan_batch=scan_batch,
     )
     return closed
@@ -614,9 +643,16 @@ def collect_new_closed_records(
     limit: int,
     *,
     stop_at_known: bool = True,
+    closed_mode: str = "overwrite",
 ) -> list[dict]:
     closed, _actionable = collect_sync_records(
-        host, token, folder_id, output_dir, limit, stop_at_known=stop_at_known
+        host,
+        token,
+        folder_id,
+        output_dir,
+        limit,
+        stop_at_known=stop_at_known,
+        closed_mode=closed_mode,
     )
     return closed
 
@@ -629,20 +665,21 @@ def collect_sync_records(
     limit: int,
     *,
     stop_at_known: bool = True,
+    closed_mode: str = "overwrite",
 ) -> tuple[list[dict], list[dict]]:
     summary_path = emails_path(output_dir)
     existing = load_emails(summary_path)
-    if not existing:
-        return scan_folder_records(host, token, folder_id, limit)
-
-    known_ids = email_ids(existing)
+    known_ids = email_ids(existing) if existing else set()
+    known_closed_cases = email_case_numbers(existing) if str(closed_mode).lower() == "skip" else set()
     return scan_folder_records(
         host,
         token,
         folder_id,
         limit,
         known_ids=known_ids,
-        stop_at_known=stop_at_known,
+        stop_at_known=stop_at_known and bool(known_ids),
+        closed_mode=closed_mode,
+        known_closed_cases=known_closed_cases,
     )
 
 
@@ -668,6 +705,7 @@ def watch_folder_emails(
     output_dir: str = "output",
     *,
     stop_at_known: bool = True,
+    closed_mode: str = "overwrite",
 ) -> None:
     token = zimbra_soap_login(host, email, password)
     folder = zimbra_resolve_folder_path(host, token, folder_path)
@@ -678,6 +716,7 @@ def watch_folder_emails(
     print(f"\n[*] Watching folder path={folder_path} (id={folder_id}, {folder_label})")
     print(f"    message limit: {limit} (newest total; keep Closed from those)")
     print(f"    stop_at_known: {stop_at_known}")
+    print(f"    closed_mode: {closed_mode}")
     print(f"    output: {summary_path.resolve()}")
 
     existing = load_emails(summary_path)
@@ -685,7 +724,13 @@ def watch_folder_emails(
         print("[*] No emails.json yet — scanning up to limit newest message(s)")
 
     new_records = collect_new_closed_records(
-        host, token, folder_id, output_dir, limit, stop_at_known=stop_at_known
+        host,
+        token,
+        folder_id,
+        output_dir,
+        limit,
+        stop_at_known=stop_at_known,
+        closed_mode=closed_mode,
     )
     if not new_records:
         if existing:
@@ -714,9 +759,15 @@ def sync_folder_emails(
     config: dict,
 ) -> None:
     from common import config_bool
-    from splunk_lookup import update_splunk_actionable_from_records, update_splunk_from_records
+    from splunk_lookup import (
+        update_mode_from_config,
+        update_splunk_actionable_from_records,
+        update_splunk_from_records,
+    )
 
     stop_at_known = config_bool(config, "stop_at_known", True)
+    closed_mode = update_mode_from_config(config, "closed_mode")
+    actionable_mode = update_mode_from_config(config, "actionable_mode")
 
     token = zimbra_soap_login(host, email, password)
     folder = zimbra_resolve_folder_path(host, token, folder_path)
@@ -727,6 +778,8 @@ def sync_folder_emails(
     print(f"\n[*] Syncing folder path={folder_path} (id={folder_id}, {folder_label})")
     print(f"    message limit: {limit} (newest total; keep Closed + actionable from those)")
     print(f"    stop_at_known: {stop_at_known}")
+    print(f"    closed_mode: {closed_mode}")
+    print(f"    actionable_mode: {actionable_mode}")
     print(f"    output: {summary_path.resolve()}")
 
     existing = load_emails(summary_path)
@@ -734,7 +787,13 @@ def sync_folder_emails(
         print("[*] No emails.json yet — scanning up to limit newest message(s)")
 
     new_records, actionable_records = collect_sync_records(
-        host, token, folder_id, output_dir, limit, stop_at_known=stop_at_known
+        host,
+        token,
+        folder_id,
+        output_dir,
+        limit,
+        stop_at_known=stop_at_known,
+        closed_mode=closed_mode,
     )
     if not new_records and not actionable_records:
         print("[+] 0 new closed message(s), 0 actionable message(s)")
