@@ -1,5 +1,6 @@
 config.json
 .env
+.venv/
 output/
 attachments/
 __pycache__/
