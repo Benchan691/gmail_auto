@@ -60,7 +60,7 @@ def lookup_name_from_case_number(case_number: str) -> str:
 
 
 LOOKUP_CSV_COLUMNS = ("TicketNumber", "Severity", "Status", "Remark", "Matrix", "Actionable")
-UPDATE_MODES = frozenset({"overwrite", "skip"})
+UPDATE_MODES = frozenset({"overwrite", "skip", "disable"})
 
 
 def _splunk_literal(value: str) -> str:
@@ -72,11 +72,11 @@ def _lookup_table_clause() -> str:
 
 
 def update_mode_from_config(config: dict, key: str, default: str = "overwrite") -> str:
-    """Return 'overwrite' or 'skip' for closed_mode / actionable_mode."""
+    """Return 'overwrite', 'skip', or 'disable' for closed_mode / actionable_mode."""
     raw = config.get(key, default)
     mode = str(raw if raw is not None else default).strip().lower()
     if mode not in UPDATE_MODES:
-        raise ValueError(f"{key} must be 'overwrite' or 'skip', got {raw!r}")
+        raise ValueError(f"{key} must be 'overwrite', 'skip', or 'disable', got {raw!r}")
     return mode
 
 
@@ -171,29 +171,29 @@ def _splunk_update_lookup_actionable(
     lookup_name: str,
     case_updates: dict[str, str],
     mode: str = "overwrite",
-) -> int:
+) -> tuple[int, list[str], list[str]]:
     rows = _splunk_fetch_lookup_rows(session, settings, lookup_name)
     if not rows:
         print(f"[-] Lookup {lookup_name} is empty or not found.")
-        return 0
+        return 0, [], []
 
     existing = {str(row.get("TicketNumber", "")).strip() for row in rows}
     matched = {ticket for ticket in case_updates if ticket in existing}
     if not matched:
         tickets = ", ".join(sorted(case_updates))
         print(f"[-] No lookup row matched TicketNumber(s) {tickets} in {lookup_name}; skipped")
-        return 0
+        return 0, [], []
 
     matched_updates = {ticket: case_updates[ticket] for ticket in matched}
     updates, skipped = select_tickets_for_update(
         matched_updates, rows, mode, actionable_already_set
     )
     if not updates:
-        return 0
+        return 0, [], sorted(skipped)
 
     search = build_splunk_actionable_update_search(lookup_name, updates)
     _splunk_write_lookup_via_spl(session, settings, search, f"update-actionable {lookup_name}")
-    return len(updates)
+    return len(updates), sorted(updates.keys()), sorted(skipped)
 
 
 def _splunk_jobs_path(owner: str, app: str) -> str:
@@ -354,6 +354,10 @@ def update_splunk_from_records(records: list[dict], config: dict) -> int:
     if not records:
         return 0
 
+    if update_mode_from_config(config, "closed_mode") == "disable":
+        debug("closed_mode=disable — skipping Splunk closed updates")
+        return 0
+
     req = require_requests()
     settings = _required_splunk_config(config)
     if not settings["verify_tls"]:
@@ -409,11 +413,20 @@ def update_splunk_from_records(records: list[dict], config: dict) -> int:
     return total_rows
 
 
-def update_splunk_actionable_from_records(records: list[dict], config: dict) -> int:
+def update_splunk_actionable_from_records(
+    records: list[dict], config: dict
+) -> tuple[int, set[str], set[str]]:
+    """Update Actionable in Splunk.
+
+    Returns (rows_written, written_ticket_numbers, skipped_already_set_tickets).
+    """
     if not records:
-        return 0
+        return 0, set(), set()
 
     mode = update_mode_from_config(config, "actionable_mode")
+    if mode == "disable":
+        debug("actionable_mode=disable — skipping Splunk actionable updates")
+        return 0, set(), set()
     req = require_requests()
     settings = _required_splunk_config(config)
     if not settings["verify_tls"]:
@@ -441,7 +454,7 @@ def update_splunk_actionable_from_records(records: list[dict], config: dict) -> 
         )
 
     if not by_lookup:
-        return 0
+        return 0, set(), set()
 
     debug(
         f"Connecting to Splunk REST for actionable updates across {len(by_lookup)} lookup(s) "
@@ -449,17 +462,27 @@ def update_splunk_actionable_from_records(records: list[dict], config: dict) -> 
     )
     session = req.Session()
     total_rows = 0
+    written_tickets: set[str] = set()
+    skipped_tickets: set[str] = set()
     for lookup_name, case_updates in by_lookup.items():
-        total_rows += _splunk_update_lookup_actionable(
+        rows, written, skipped = _splunk_update_lookup_actionable(
             session, settings, lookup_name, case_updates, mode=mode
         )
+        total_rows += rows
+        written_tickets.update(written)
+        skipped_tickets.update(skipped)
 
-    return total_rows
+    return total_rows, written_tickets, skipped_tickets
 
 
 def update_splunk_from_folder(host: str, email: str, password: str, folder_path: str, limit: int, config: dict) -> None:
     debug("Starting update-splunk")
     debug(f"Mail host={host} folder_path={folder_path} limit={limit}")
+
+    closed_mode = update_mode_from_config(config, "closed_mode")
+    if closed_mode == "disable":
+        print("[*] closed_mode=disable — skipping closed Splunk updates")
+        return
 
     settings = _required_splunk_config(config)
     debug(
@@ -474,7 +497,7 @@ def update_splunk_from_folder(host: str, email: str, password: str, folder_path:
     folder_label = f"{folder['name']} ({folder['abs_path']})" if folder else f"id={folder_id}"
     debug(f"Zimbra folder resolved: {folder_label}")
 
-    closed_records = scan_closed_folder_records(host, token, folder_id, limit)
+    closed_records = scan_closed_folder_records(host, token, folder_id, limit, closed_mode=closed_mode)
     debug(f"Zimbra closed scan complete: records={len(closed_records)}")
     if not closed_records:
         print("[-] No closed messages found in this folder.")
@@ -609,6 +632,8 @@ Second line "quoted"
     assert update_mode_from_config({}, "closed_mode") == "overwrite"
     assert update_mode_from_config({"closed_mode": "SKIP"}, "closed_mode") == "skip"
     assert update_mode_from_config({"actionable_mode": "overwrite"}, "actionable_mode") == "overwrite"
+    assert update_mode_from_config({"closed_mode": "DISABLE"}, "closed_mode") == "disable"
+    assert update_mode_from_config({"actionable_mode": "disable"}, "actionable_mode") == "disable"
     try:
         update_mode_from_config({"closed_mode": "force"}, "closed_mode")
         assert False, "expected ValueError for invalid mode"

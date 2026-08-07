@@ -314,6 +314,63 @@ class TestScanClosedFolderRecords(unittest.TestCase):
 
         self.assertEqual([r["id"] for r in closed], ["closed-other"])
 
+    def test_closed_mode_disable_skips_closed_keeps_actionable(self):
+        hits = [
+            {"id": "open-yes", "actionable": "Yes", "case_number": "500952026070510025941"},
+            {"id": "closed1", "case_number": "500952026070510025942"},
+            {"id": "open-no", "actionable": "No", "case_number": "500952026070510025943"},
+        ]
+
+        def search(host, token, query, limit=50, offset=0):
+            return hits[offset : offset + limit]
+
+        import zimbra as zimbra_module
+
+        with patch.object(zimbra_module, "zimbra_search", side_effect=search):
+            with patch.object(zimbra_module, "message_to_record", side_effect=lambda h, t, hit: self._fake_record(hit)):
+                closed, actionable = scan_folder_records(
+                    "h",
+                    "t",
+                    "373",
+                    10,
+                    closed_mode="disable",
+                    actionable_mode="overwrite",
+                    scan_batch=10,
+                )
+
+        self.assertEqual(closed, [])
+        self.assertEqual(
+            [(r["id"], r["actionable"]) for r in actionable],
+            [("open-yes", "Yes"), ("open-no", "No")],
+        )
+
+    def test_actionable_mode_disable_skips_actionable_keeps_closed(self):
+        hits = [
+            {"id": "open-yes", "actionable": "Yes", "case_number": "500952026070510025941"},
+            {"id": "closed1", "case_number": "500952026070510025942"},
+            {"id": "open-no", "actionable": "No", "case_number": "500952026070510025943"},
+        ]
+
+        def search(host, token, query, limit=50, offset=0):
+            return hits[offset : offset + limit]
+
+        import zimbra as zimbra_module
+
+        with patch.object(zimbra_module, "zimbra_search", side_effect=search):
+            with patch.object(zimbra_module, "message_to_record", side_effect=lambda h, t, hit: self._fake_record(hit)):
+                closed, actionable = scan_folder_records(
+                    "h",
+                    "t",
+                    "373",
+                    10,
+                    closed_mode="overwrite",
+                    actionable_mode="disable",
+                    scan_batch=10,
+                )
+
+        self.assertEqual([r["id"] for r in closed], ["closed1"])
+        self.assertEqual(actionable, [])
+
     def test_paginates_until_total_message_limit(self):
         batch1 = [{"id": f"open{i}"} for i in range(3)]
         batch2 = [
@@ -404,6 +461,7 @@ class TestSyncFolderEmails(unittest.TestCase):
             10,
             stop_at_known=True,
             closed_mode="overwrite",
+            actionable_mode="overwrite",
         )
         mock_save.assert_called_once_with("output", new_records, 10)
         mock_splunk.assert_called_once_with(new_records, {})
@@ -422,7 +480,7 @@ class TestSyncFolderEmails(unittest.TestCase):
         mock_login.return_value = "token"
         mock_resolve.return_value = {"id": "373", "name": "Inbox", "abs_path": "/Inbox"}
         mock_collect.return_value = ([], actionable)
-        mock_actionable.return_value = 1
+        mock_actionable.return_value = (1, {"500952026070510025941"}, set())
 
         sync_folder_emails("host", "user@example.com", "pass", "373", 10, "output", {})
 
@@ -448,6 +506,36 @@ class TestSyncFolderEmails(unittest.TestCase):
         mock_save.assert_not_called()
         mock_splunk.assert_not_called()
         mock_actionable.assert_not_called()
+
+    @patch("splunk_lookup.update_splunk_actionable_from_records")
+    @patch("splunk_lookup.update_splunk_from_records")
+    @patch("zimbra.save_new_closed_records")
+    @patch("zimbra.collect_sync_records")
+    @patch("zimbra.zimbra_resolve_folder_path")
+    @patch("zimbra.zimbra_soap_login")
+    def test_sync_actionable_skip_summary_hides_already_set(
+        self, mock_login, mock_resolve, mock_collect, mock_save, mock_splunk, mock_actionable
+    ):
+        actionable = [self._actionable("open-1")]
+        mock_login.return_value = "token"
+        mock_resolve.return_value = {"id": "373", "name": "Inbox", "abs_path": "/Inbox"}
+        mock_collect.return_value = ([], actionable)
+        mock_actionable.return_value = (0, set(), {"500952026070510025941"})
+
+        from io import StringIO
+        import sys
+
+        buf = StringIO()
+        old = sys.stdout
+        sys.stdout = buf
+        try:
+            sync_folder_emails("host", "user@example.com", "pass", "373", 10, "output", {})
+        finally:
+            sys.stdout = old
+        out = buf.getvalue()
+        self.assertIn("Actionable: 0", out)
+        self.assertIn("Actionable skipped (already set): 1", out)
+        self.assertIn("500952026070510025941", out)
 
 
 if __name__ == "__main__":

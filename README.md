@@ -39,8 +39,8 @@ SPLUNK_PASSWORD=your-splunk-password
 | `folder_path` | Folder name/path or folder id (e.g. `Inbox` or `373`) |
 | `limit` | Max newest messages to scan each run |
 | `stop_at_known` | If `true`, stop scanning when a previously saved message id is hit |
-| `closed_mode` | `overwrite` (default) reprocess closed cases; `skip` drops duplicate closed cases (same case number), including cases already saved in `emails.json`. Does **not** filter by message id new/old |
-| `actionable_mode` | `overwrite` (default) always write Actionable; `skip` leaves Splunk rows that already have an Actionable value |
+| `closed_mode` | `overwrite` (default) reprocess closed cases; `skip` drops duplicate closed cases (same case number), including cases already saved in `emails.json`; `disable` turns off closed collection and updates entirely (no JSON save, no Splunk Status/Remark/Matrix). Does **not** filter by message id new/old |
+| `actionable_mode` | `overwrite` (default) always write Actionable; `skip` leaves Splunk rows that already have an Actionable value (summary shows those under “Actionable skipped”); `disable` turns off actionable collection and Splunk Actionable writes |
 | `splunk_web_url` / `splunk_rest_url` | Splunk UI or REST base URL (REST defaults to host `:8089` if empty) |
 | `splunk_app` / `splunk_owner` | App/owner namespace for lookup writes |
 | `splunk_verify_tls` | TLS verify for Splunk REST |

@@ -469,6 +469,7 @@ def scan_folder_records(
     known_ids=None,
     stop_at_known: bool = False,
     closed_mode: str = "overwrite",
+    actionable_mode: str = "overwrite",
     known_closed_cases=None,
     scan_batch: int = 50,
 ) -> tuple[list[dict], list[dict]]:
@@ -477,6 +478,7 @@ def scan_folder_records(
     ``limit`` is the max number of messages examined (any status), newest first.
     Closed messages are deduped by case number (newest first). With
     ``closed_mode=skip``, cases already in ``known_closed_cases`` are skipped.
+    ``closed_mode=disable`` / ``actionable_mode=disable`` skip collecting that type.
     Message id new/old is not used for closed keep/skip (only ``stop_at_known``).
     Actionable updates = non-Closed TrustCSI replies with a usable case number
     (Yes if To includes IT Support, otherwise No).
@@ -484,6 +486,7 @@ def scan_folder_records(
     known = known_ids or set()
     known_cases = known_closed_cases or set()
     mode = str(closed_mode or "overwrite").strip().lower()
+    act_mode = str(actionable_mode or "overwrite").strip().lower()
     closed: list[dict] = []
     actionable: list[dict] = []
     seen_closed_cases: set[str] = set()
@@ -498,7 +501,7 @@ def scan_folder_records(
     _filter_log(
         f"start folder_id={folder_id} query={query!r} total_message_limit={total_limit} "
         f"stop_at_known={stop_at_known} known_ids={len(known)} closed_mode={mode} "
-        f"known_closed_cases={len(known_cases)} scan_batch={scan_batch}"
+        f"actionable_mode={act_mode} known_closed_cases={len(known_cases)} scan_batch={scan_batch}"
     )
 
     if total_limit <= 0:
@@ -536,7 +539,7 @@ def scan_folder_records(
             subject = (record.get("subject") or hit_subject or "")[:80]
             actionable_flag = actionable_flag_for_record(record)
 
-            if actionable_flag is not None:
+            if act_mode != "disable" and actionable_flag is not None:
                 case_key = str(case_number).strip()
                 if case_key not in seen_actionable_cases:
                     seen_actionable_cases.add(case_key)
@@ -561,6 +564,13 @@ def scan_folder_records(
                         f"SKIP id={hit_id} case={case_number} status={status!r} "
                         f"subject={subject!r} reason=not_closed examined={examined}/{total_limit}"
                     )
+                continue
+
+            if mode == "disable":
+                _filter_log(
+                    f"SKIP id={hit_id} case={case_number} status={status!r} "
+                    f"subject={subject!r} reason=closed_disabled examined={examined}/{total_limit}"
+                )
                 continue
 
             case_key = str(case_number or "").strip()
@@ -620,6 +630,7 @@ def scan_closed_folder_records(
         known_ids=known_ids,
         stop_at_known=stop_at_known,
         closed_mode=closed_mode,
+        actionable_mode="disable",
         known_closed_cases=known_closed_cases,
         scan_batch=scan_batch,
     )
@@ -664,6 +675,7 @@ def collect_new_closed_records(
         limit,
         stop_at_known=stop_at_known,
         closed_mode=closed_mode,
+        actionable_mode="disable",
     )
     return closed
 
@@ -677,6 +689,7 @@ def collect_sync_records(
     *,
     stop_at_known: bool = True,
     closed_mode: str = "overwrite",
+    actionable_mode: str = "overwrite",
 ) -> tuple[list[dict], list[dict]]:
     summary_path = emails_path(output_dir)
     existing = load_emails(summary_path)
@@ -690,6 +703,7 @@ def collect_sync_records(
         known_ids=known_ids,
         stop_at_known=stop_at_known and bool(known_ids),
         closed_mode=closed_mode,
+        actionable_mode=actionable_mode,
         known_closed_cases=known_closed_cases,
     )
 
@@ -718,6 +732,10 @@ def watch_folder_emails(
     stop_at_known: bool = True,
     closed_mode: str = "overwrite",
 ) -> None:
+    if str(closed_mode).strip().lower() == "disable":
+        print("\n[*] closed_mode=disable — skipping closed watch")
+        return
+
     token = zimbra_soap_login(host, email, password)
     folder = zimbra_resolve_folder_path(host, token, folder_path)
     folder_id = folder["id"]
@@ -772,6 +790,16 @@ def _print_ticket_summary(label: str, records: list[dict], *, actionable: bool =
         print(f"  ... and {len(records) - 10} more")
 
 
+def _print_skipped_actionable(skipped_tickets: list[str]) -> None:
+    if not skipped_tickets:
+        return
+    print(f"\nActionable skipped (already set): {len(skipped_tickets)}")
+    for ticket in skipped_tickets[:10]:
+        print(f"  {ticket}")
+    if len(skipped_tickets) > 10:
+        print(f"  ... and {len(skipped_tickets) - 10} more")
+
+
 def sync_folder_emails(
     host: str,
     email: str,
@@ -804,18 +832,37 @@ def sync_folder_emails(
         limit,
         stop_at_known=stop_at_known,
         closed_mode=closed_mode,
+        actionable_mode=actionable_mode,
     )
 
-    if new_records:
+    if closed_mode != "disable" and new_records:
         save_new_closed_records(output_dir, new_records, limit)
 
-    if new_records:
+    if closed_mode != "disable" and new_records:
         update_splunk_from_records(new_records, config)
-    if actionable_records:
-        update_splunk_actionable_from_records(actionable_records, config)
 
-    _print_ticket_summary("Closed", new_records)
-    _print_ticket_summary("Actionable", actionable_records, actionable=True)
+    written_tickets: set[str] = set()
+    skipped_tickets: set[str] = set()
+    if actionable_mode != "disable" and actionable_records:
+        _, written_tickets, skipped_tickets = update_splunk_actionable_from_records(
+            actionable_records, config
+        )
+
+    actionable_updated = [
+        record
+        for record in actionable_records
+        if str(record.get("case_number") or "").strip() in written_tickets
+    ]
+
+    if closed_mode == "disable":
+        print("\nClosed: disabled")
+    else:
+        _print_ticket_summary("Closed", new_records)
+    if actionable_mode == "disable":
+        print("\nActionable: disabled")
+    else:
+        _print_ticket_summary("Actionable", actionable_updated, actionable=True)
+        _print_skipped_actionable(sorted(skipped_tickets))
 
 
 def list_folder_emails(host: str, email: str, password: str, folder_path: str, limit: int) -> None:
