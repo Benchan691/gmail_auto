@@ -15,6 +15,7 @@ from email_store import (
 )
 
 IT_SUPPORT_EMAIL = "it.support@kaitaksportspark.com.hk"
+SOC_SENDER_EMAIL = "soc@citictel-cpc.com"
 
 
 def zimbra_soap_login(host: str, email: str, password: str) -> str:
@@ -377,6 +378,7 @@ def message_to_record(host: str, token: str, hit: dict) -> dict:
     )
     # In-memory only — stripped before emails.json persistence.
     record["to"] = details.get("to") or []
+    record["sender_email"] = details.get("sender_email") or hit.get("sender_email") or ""
     return record
 
 
@@ -415,6 +417,11 @@ def has_it_support_recipient(to_list) -> bool:
     return False
 
 
+def has_soc_sender(record: dict) -> bool:
+    email = str(record.get("sender_email") or "").strip().lower()
+    return email == SOC_SENDER_EMAIL.lower()
+
+
 def is_actionable_candidate(record: dict) -> bool:
     return actionable_flag_for_record(record) is not None
 
@@ -422,9 +429,10 @@ def is_actionable_candidate(record: dict) -> bool:
 def actionable_flag_for_record(record: dict) -> Optional[str]:
     """Return Actionable value for non-Closed TrustCSI replies, else None.
 
+    - Sender must be soc@citictel-cpc.com
     - To includes IT Support → "Yes"
     - TrustCSI reply with case number but no IT Support in To → "No"
-    - Closed / unrelated / non-matching subject → None (do not update Actionable)
+    - Closed / unrelated / non-matching subject / wrong sender → None
     """
     if is_closed_record(record):
         return None
@@ -432,6 +440,8 @@ def actionable_flag_for_record(record: dict) -> Optional[str]:
     if not case_number or case_number in {"N/A", "unrelated"}:
         return None
     if not is_trustcsi_reply_subject(record.get("subject") or ""):
+        return None
+    if not has_soc_sender(record):
         return None
     return "Yes" if has_it_support_recipient(record.get("to")) else "No"
 

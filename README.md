@@ -10,7 +10,7 @@ Reads TrustCSI case emails from Zimbra, parses case fields, and updates Splunk C
 | Remark | resolution text (True/False Positive labels removed) |
 | Matrix | `False Positive` by default; `True Positive` only when resolution contains that label |
 
-**Non-closed TrustCSI replies** set `Actionable` to `Yes` (To includes IT Support) or `No`.
+**Non-closed TrustCSI replies from `soc@citictel-cpc.com`** set `Actionable` to `Yes` (To includes IT Support) or `No`.
 
 CSV column order on write:
 

@@ -5,6 +5,7 @@ from email_store import email_ids, merge_new_emails
 from zimbra import (
     actionable_flag_for_record,
     has_it_support_recipient,
+    has_soc_sender,
     is_actionable_candidate,
     is_closed_record,
     is_trustcsi_reply_subject,
@@ -79,11 +80,19 @@ class TestActionableMatchers(unittest.TestCase):
         )
         self.assertFalse(has_it_support_recipient([]))
 
+    def test_soc_sender(self):
+        self.assertTrue(has_soc_sender({"sender_email": "soc@citictel-cpc.com"}))
+        self.assertTrue(has_soc_sender({"sender_email": "SOC@Citictel-CPC.com"}))
+        self.assertFalse(has_soc_sender({"sender_email": "other@citictel-cpc.com"}))
+        self.assertFalse(has_soc_sender({"sender_email": ""}))
+        self.assertFalse(has_soc_sender({}))
+
     def test_actionable_candidate_non_closed_only(self):
         base = {
             "case_number": "500952026070510025940",
             "case_status": "Open",
             "subject": "Re: TrustCSI Security Incident Notification (Case Number: 50095)",
+            "sender_email": "soc@citictel-cpc.com",
             "to": [{"name": "it support", "email": "it.support@kaitaksportspark.com.hk"}],
         }
         self.assertTrue(is_actionable_candidate(base))
@@ -97,8 +106,15 @@ class TestActionableMatchers(unittest.TestCase):
         )
         self.assertIsNone(actionable_flag_for_record({**base, "case_status": "Closed"}))
         self.assertIsNone(actionable_flag_for_record({**base, "case_number": None}))
+        self.assertIsNone(
+            actionable_flag_for_record({**base, "sender_email": "other@citictel-cpc.com"})
+        )
+        self.assertIsNone(actionable_flag_for_record({**base, "sender_email": ""}))
         self.assertFalse(is_actionable_candidate({**base, "case_status": "Closed"}))
         self.assertFalse(is_actionable_candidate({**base, "case_number": None}))
+        self.assertFalse(
+            is_actionable_candidate({**base, "sender_email": "other@example.com"})
+        )
 
     def test_record_for_json_strips_to(self):
         record = {
@@ -128,6 +144,7 @@ class TestScanClosedFolderRecords(unittest.TestCase):
         if hit.get("actionable"):
             record["subject"] = "Re: TrustCSI Security Incident Notification (Case Number: 50095)"
             record["case_number"] = hit.get("case_number", "500952026070510025940")
+            record["sender_email"] = "soc@citictel-cpc.com"
             if hit.get("actionable") == "No":
                 record["to"] = []
             else:
@@ -135,6 +152,7 @@ class TestScanClosedFolderRecords(unittest.TestCase):
         else:
             record["subject"] = "Other"
             record["to"] = []
+            record["sender_email"] = ""
         return record
 
     def test_keeps_closed_within_total_message_limit(self):
@@ -352,6 +370,7 @@ class TestSyncFolderEmails(unittest.TestCase):
             "case_status": "Open",
             "resolution": None,
             "actionable": flag,
+            "sender_email": "soc@citictel-cpc.com",
             "to": [{"name": "it support", "email": "it.support@kaitaksportspark.com.hk"}],
         }
         if flag == "No":
