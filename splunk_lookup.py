@@ -162,8 +162,6 @@ def _splunk_update_lookup_cases(
     updates = {ticket: case_updates[ticket] for ticket in matched}
     search = build_splunk_batch_update_search(lookup_name, updates)
     _splunk_write_lookup_via_spl(session, settings, search, f"update {lookup_name}")
-    for ticket in sorted(updates):
-        print(f"[+] Updated TicketNumber={ticket} in {lookup_name}")
     return len(updates)
 
 
@@ -190,18 +188,11 @@ def _splunk_update_lookup_actionable(
     updates, skipped = select_tickets_for_update(
         matched_updates, rows, mode, actionable_already_set
     )
-    for ticket in sorted(skipped):
-        print(
-            f"[=] Skip actionable TicketNumber={ticket} in {lookup_name} "
-            f"(already set, actionable_mode=skip)"
-        )
     if not updates:
         return 0
 
     search = build_splunk_actionable_update_search(lookup_name, updates)
     _splunk_write_lookup_via_spl(session, settings, search, f"update-actionable {lookup_name}")
-    for ticket in sorted(updates):
-        print(f"[+] Set Actionable={updates[ticket]} TicketNumber={ticket} in {lookup_name}")
     return len(updates)
 
 
@@ -400,10 +391,8 @@ def update_splunk_from_records(records: list[dict], config: dict) -> int:
         )
 
     if not updates:
-        print("[-] No closed cases with usable resolutions found.")
         return 0
 
-    debug(f"Connecting to Splunk REST for {len(updates)} queued case update(s)")
     session = req.Session()
     by_lookup: dict[str, dict[str, dict[str, str]]] = {}
     for update in updates.values():
@@ -417,7 +406,6 @@ def update_splunk_from_records(records: list[dict], config: dict) -> int:
     for lookup_name, case_updates in by_lookup.items():
         total_rows += _splunk_update_lookup_cases(session, settings, lookup_name, case_updates)
 
-    print(f"[+] Done. Cases queued={len(updates)} lookup rows updated={total_rows}")
     return total_rows
 
 
@@ -453,7 +441,6 @@ def update_splunk_actionable_from_records(records: list[dict], config: dict) -> 
         )
 
     if not by_lookup:
-        print("[-] No actionable cases with usable case numbers found.")
         return 0
 
     debug(
@@ -467,7 +454,6 @@ def update_splunk_actionable_from_records(records: list[dict], config: dict) -> 
             session, settings, lookup_name, case_updates, mode=mode
         )
 
-    print(f"[+] Done. Actionable lookups={len(by_lookup)} rows updated={total_rows}")
     return total_rows
 
 

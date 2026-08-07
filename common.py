@@ -75,7 +75,8 @@ def load_config(path: str = CONFIG_PATH, env_path: str = ENV_PATH) -> dict:
 
 
 def debug(message: str) -> None:
-    print(f"[debug] {message}")
+    """No-op reserved for optional verbose tracing."""
+    return
 
 
 def config_bool(config: dict, key: str, default: bool = False) -> bool:

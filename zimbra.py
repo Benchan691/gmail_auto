@@ -437,7 +437,8 @@ def actionable_flag_for_record(record: dict) -> Optional[str]:
 
 
 def _filter_log(message: str) -> None:
-    print(f"[filter] {message}")
+    """No-op reserved for optional scan tracing."""
+    return
 
 
 def _closed_dedupe_key(case_number, record_id) -> str:
@@ -749,6 +750,18 @@ def watch_folder_emails(
         _print_record(index, record)
 
 
+def _print_ticket_summary(label: str, records: list[dict], *, actionable: bool = False) -> None:
+    print(f"\n{label}: {len(records)}")
+    for record in records[:10]:
+        case_number = record.get("case_number") or "N/A"
+        if actionable:
+            print(f"  {case_number}  Actionable={record.get('actionable')}")
+        else:
+            print(f"  {case_number}")
+    if len(records) > 10:
+        print(f"  ... and {len(records) - 10} more")
+
+
 def sync_folder_emails(
     host: str,
     email: str,
@@ -772,19 +785,6 @@ def sync_folder_emails(
     token = zimbra_soap_login(host, email, password)
     folder = zimbra_resolve_folder_path(host, token, folder_path)
     folder_id = folder["id"]
-    folder_label = f"{folder['name']} ({folder['abs_path']})" if folder else f"id={folder_id}"
-    summary_path = emails_path(output_dir)
-
-    print(f"\n[*] Syncing folder path={folder_path} (id={folder_id}, {folder_label})")
-    print(f"    message limit: {limit} (newest total; keep Closed + actionable from those)")
-    print(f"    stop_at_known: {stop_at_known}")
-    print(f"    closed_mode: {closed_mode}")
-    print(f"    actionable_mode: {actionable_mode}")
-    print(f"    output: {summary_path.resolve()}")
-
-    existing = load_emails(summary_path)
-    if not existing:
-        print("[*] No emails.json yet — scanning up to limit newest message(s)")
 
     new_records, actionable_records = collect_sync_records(
         host,
@@ -795,37 +795,17 @@ def sync_folder_emails(
         stop_at_known=stop_at_known,
         closed_mode=closed_mode,
     )
-    if not new_records and not actionable_records:
-        print("[+] 0 new closed message(s), 0 actionable message(s)")
-        return
 
-    total = len(existing)
     if new_records:
-        total = save_new_closed_records(output_dir, new_records, limit)
-        for index, record in enumerate(new_records, start=1):
-            _print_record(index, record)
-    else:
-        print("[+] 0 new closed message(s)")
+        save_new_closed_records(output_dir, new_records, limit)
 
+    if new_records:
+        update_splunk_from_records(new_records, config)
     if actionable_records:
-        print(f"[*] {len(actionable_records)} actionable non-Closed message(s)")
-        for index, record in enumerate(actionable_records, start=1):
-            print(
-                f"\n  A{index}. id={record.get('id')} case={record.get('case_number')} "
-                f"status={record.get('case_status')} Actionable={record.get('actionable')}"
-            )
-            print(f"      subject: {record.get('subject')}")
+        update_splunk_actionable_from_records(actionable_records, config)
 
-    splunk_rows = update_splunk_from_records(new_records, config) if new_records else 0
-    actionable_rows = (
-        update_splunk_actionable_from_records(actionable_records, config) if actionable_records else 0
-    )
-    print(
-        f"\n[+] Sync complete: {len(new_records)} new closed message(s), "
-        f"{total} total in {summary_path.resolve()}, "
-        f"{splunk_rows} closed Splunk row(s) updated, "
-        f"{actionable_rows} actionable Splunk row(s) updated"
-    )
+    _print_ticket_summary("Closed", new_records)
+    _print_ticket_summary("Actionable", actionable_records, actionable=True)
 
 
 def list_folder_emails(host: str, email: str, password: str, folder_path: str, limit: int) -> None:
